@@ -13,6 +13,7 @@ pub mod fields;
 pub mod index_key;
 pub mod order;
 pub mod path;
+pub mod plan;
 pub mod query;
 pub mod store;
 pub mod txn;

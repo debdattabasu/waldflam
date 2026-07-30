@@ -42,11 +42,18 @@ These are the ones to fix before calling waldflam production-ready.
   point-in-time read silently get latest state. Firestore keeps history; we
   overwrite in place. Fix needs a versioned storage design — non-trivial, and
   worth deciding whether to support at all.
-- **Queries are full-collection scans.** `run_query` fetches the collection and
-  filters/sorts in memory (the emulator does the same, so semantics are right).
-  The index entries are written to Mongo but not yet *used*. Fix: plan queries
-  against `$indexedFields` and let Mongo do the work — the encoding is
-  designed for exactly this.
+- **Sorting, cursors, and limits still happen in memory.** Filters are pushed
+  into MongoDB (`waldflam-engine/src/plan.rs`), so a query no longer reads the
+  whole collection — but every candidate that survives the predicate is still
+  fetched, sorted, and truncated in the server. A query whose *filters* are
+  broad but whose `limit` is small therefore reads far more than it returns.
+  Fix: push `sort` + `limit` down too, which needs an index key per
+  normalized order-by rather than the unordered `indexed` array.
+- **Some filters can't be planned and still scan.** `!=` and `not-in` narrow
+  only to "field exists"; `OR` isn't supported at all; backtick-escaped field
+  paths are skipped deliberately, since a dotted path is ambiguous between a
+  nested map and a field whose name contains a dot. Each of these falls back
+  to a collection scan plus in-memory filtering, which is correct but slow.
 - **No document-size, depth, or path-length limits.** Firestore rejects
   documents over 1 MiB, nesting past 20/50 levels, path segments over 1500
   bytes, and paths over 100 segments. Constants are recorded in

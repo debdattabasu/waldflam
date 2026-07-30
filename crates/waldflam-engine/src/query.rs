@@ -1,8 +1,11 @@
 //! StructuredQuery evaluation.
 //!
-//! M1 strategy (same as the official emulator): fetch the target collection,
-//! then filter/sort/cursor in memory with the exact comparator. Index-backed
-//! scans come later; semantics first.
+//! Two stages. `plan` turns the filters into a MongoDB predicate over the
+//! stored index entries, so the server fetches candidates instead of whole
+//! collections; then the exact Firestore semantics are applied in memory to
+//! whatever comes back. The predicate is only ever a superset of the query
+//! (see `plan`), so this stage is a pure I/O optimization — the results are
+//! identical to scanning everything.
 //!
 //! Implemented semantics (docs/architecture.md §3/§11): fields must exist to
 //! match any filter or order-by; inequalities are type-bounded (same type
@@ -33,28 +36,55 @@ pub async fn run_query(
     parent: &ResourcePath,
     query: &StructuredQuery,
 ) -> Result<Vec<StoredDocument>, EngineError> {
+    evaluate(store, database, parent, query, true).await
+}
+
+/// `run_query` with the index planner switched off, so every document in the
+/// collection is a candidate. Same results, more I/O — it is the reference
+/// path the planner is checked against, and the fallback if a predicate is
+/// ever suspected of dropping matches.
+pub async fn run_query_scanning(
+    store: &Store,
+    database: &DatabaseName,
+    parent: &ResourcePath,
+    query: &StructuredQuery,
+) -> Result<Vec<StoredDocument>, EngineError> {
+    evaluate(store, database, parent, query, false).await
+}
+
+async fn evaluate(
+    store: &Store,
+    database: &DatabaseName,
+    parent: &ResourcePath,
+    query: &StructuredQuery,
+    planned: bool,
+) -> Result<Vec<StoredDocument>, EngineError> {
     let [selector] = query.from.as_slice() else {
         return Err(EngineError::InvalidArgument(
             "StructuredQuery.from must have exactly one collection selector".into(),
         ));
     };
 
-    // Candidate set.
-    let mut docs = if selector.all_descendants {
-        if !parent.is_empty() {
-            return Err(EngineError::Unimplemented("collection-group queries below the root"));
-        }
-        store.list_collection_group(database, &selector.collection_id).await?
-    } else {
-        let collection = parent.child(&selector.collection_id)?;
-        store.list_collection(database, &collection).await?
-    };
-
-    // Filters.
+    // Filters, flattened first so they can drive the index predicate.
     let mut filters = Vec::new();
     if let Some(filter) = query.r#where.as_ref() {
         flatten_and(filter, &mut filters)?;
     }
+    let predicate = planned.then(|| crate::plan::mongo_predicate(&filters)).flatten();
+
+    // Candidate set: narrowed by the index where the planner could, whole
+    // collection where it couldn't.
+    let mut docs = if selector.all_descendants {
+        if !parent.is_empty() {
+            return Err(EngineError::Unimplemented("collection-group queries below the root"));
+        }
+        store.list_collection_group_where(database, &selector.collection_id, predicate).await?
+    } else {
+        let collection = parent.child(&selector.collection_id)?;
+        store.list_collection_where(database, &collection, predicate).await?
+    };
+
+    // Exact semantics over the candidates.
     docs.retain(|doc| filters.iter().all(|f| matches_filter(database, doc, f)));
 
     // Normalized order-bys: explicit, then inequality fields, then __name__.

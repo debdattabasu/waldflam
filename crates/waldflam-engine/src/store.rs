@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use mongodb::bson::spec::BinarySubtype;
-use mongodb::bson::{Binary, doc, to_bson};
+use mongodb::bson::{Binary, Document as BsonDocument, doc, to_bson};
 use mongodb::options::ReturnDocument;
 use mongodb::{Client, ClientSession, Collection, Database};
 use prost::Message;
@@ -90,6 +90,8 @@ pub struct Store {
     /// Identifies this process's commits so the fan-out tail can skip the
     /// ones it published itself (already delivered in-process).
     instance_id: Arc<str>,
+    /// Databases whose query indexes this process has already ensured.
+    indexed_databases: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Store {
@@ -102,6 +104,7 @@ impl Store {
         let store = Self {
             db: client.database("waldflam"),
             instance_id: format!("{}-{nanos}", std::process::id()).into(),
+            indexed_databases: Default::default(),
         };
         store.ensure_event_ttl_index().await?;
         Ok(store)
@@ -290,12 +293,21 @@ impl Store {
         database: &DatabaseName,
         collection_path: &ResourcePath,
     ) -> Result<Vec<StoredDocument>, EngineError> {
-        self.collect_rows(
-            self.collection(database)
-                .find(doc! { "collection_path": collection_path.to_string() })
-                .await?,
-        )
-        .await
+        self.list_collection_where(database, collection_path, None).await
+    }
+
+    /// As `list_collection`, narrowed by an index predicate from `plan`.
+    /// The predicate may over-match; callers still apply exact semantics.
+    pub async fn list_collection_where(
+        &self,
+        database: &DatabaseName,
+        collection_path: &ResourcePath,
+        predicate: Option<BsonDocument>,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        let filter = self
+            .narrowed(database, doc! { "collection_path": collection_path.to_string() }, predicate)
+            .await?;
+        self.collect_rows(self.collection(database).find(filter).await?).await
     }
 
     /// All documents in every collection with this id (collection group).
@@ -304,10 +316,60 @@ impl Store {
         database: &DatabaseName,
         collection_id: &str,
     ) -> Result<Vec<StoredDocument>, EngineError> {
-        self.collect_rows(
-            self.collection(database).find(doc! { "collection_id": collection_id }).await?,
-        )
-        .await
+        self.list_collection_group_where(database, collection_id, None).await
+    }
+
+    /// As `list_collection_group`, narrowed by an index predicate.
+    pub async fn list_collection_group_where(
+        &self,
+        database: &DatabaseName,
+        collection_id: &str,
+        predicate: Option<BsonDocument>,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        let filter =
+            self.narrowed(database, doc! { "collection_id": collection_id }, predicate).await?;
+        self.collect_rows(self.collection(database).find(filter).await?).await
+    }
+
+    /// Folds an index predicate into a base filter, ensuring the indexes that
+    /// serve it exist first.
+    async fn narrowed(
+        &self,
+        database: &DatabaseName,
+        mut base: BsonDocument,
+        predicate: Option<BsonDocument>,
+    ) -> Result<BsonDocument, EngineError> {
+        if let Some(predicate) = predicate {
+            self.ensure_query_indexes(database).await?;
+            for (key, value) in predicate {
+                base.insert(key, value);
+            }
+        }
+        Ok(base)
+    }
+
+    /// Creates the compound multikey indexes the planner's predicates ride
+    /// on, once per database per process. Both keys live inside the same
+    /// `indexed` array, which MongoDB allows (the parallel-array restriction
+    /// is about two *different* arrays), so an `$elemMatch` on `p` and `v`
+    /// can be served by one index scan.
+    async fn ensure_query_indexes(&self, database: &DatabaseName) -> Result<(), EngineError> {
+        let name = format!("{}~{}", database.project_id, database.database_id);
+        {
+            let done = self.indexed_databases.lock().expect("index cache");
+            if done.contains(&name) {
+                return Ok(());
+            }
+        }
+        let models = [
+            doc! { "collection_path": 1, "indexed.p": 1, "indexed.v": 1 },
+            doc! { "collection_id": 1, "indexed.p": 1, "indexed.v": 1 },
+        ]
+        .map(|keys| mongodb::IndexModel::builder().keys(keys).build());
+        // Idempotent: a concurrent caller creating the same indexes is fine.
+        self.collection(database).create_indexes(models).await?;
+        self.indexed_databases.lock().expect("index cache").insert(name);
+        Ok(())
     }
 
     /// Distinct collection ids directly under `parent` (the documents root

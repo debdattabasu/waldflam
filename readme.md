@@ -66,10 +66,11 @@ streaming writes, security rules, and Cloud Functions triggers. Seven
 conformance suites in [conformance/](conformance/) prove it against a live
 server on every run.
 
-Still **pre-alpha for production**: queries scan rather than use the indexes
-they write, and JWTs are decoded but not verified (emulator semantics). Those
-and everything else known-missing are catalogued honestly in
-[backlog.md](backlog.md) — read it before deploying anything you care about.
+Still **pre-alpha for production**: query sorting and limits are applied in
+the server rather than pushed into the database, and JWTs are decoded but not
+verified (emulator semantics). Those and everything else known-missing are
+catalogued honestly in [backlog.md](backlog.md) — read it before deploying
+anything you care about.
 
 - [x] **M0 — scaffold**: workspace, full 17-RPC `google.firestore.v1` gRPC
   surface served on h2c, value ordering + resource-name parsing + emulator
@@ -90,12 +91,15 @@ and everything else known-missing are catalogued honestly in
   events delivered as CloudEvents to your HTTP endpoints, with path-pattern
   params and before/after payloads
 
-Next up is depth rather than breadth — index-backed queries, production auth.
-Two pieces already landed: commits are **atomic** (each runs in a MongoDB
-transaction, so a batch never half-lands and concurrent writers can't lose an
-update), and waldflam runs **multi-instance** (every commit is announced
-through a change stream, so a listener on one instance sees writes applied on
-any of them). See [backlog.md](backlog.md).
+Next up is depth rather than breadth — pushing sort and limit into the
+database, then production auth. Three pieces already landed: commits are
+**atomic** (each runs in a MongoDB transaction, so a batch never half-lands
+and concurrent writers can't lose an update), waldflam runs **multi-instance**
+(every commit is announced through a change stream, so a listener on one
+instance sees writes applied on any of them), and query filters are
+**index-backed** (translated into MongoDB predicates over the stored
+order-preserving index keys, served by an index scan instead of reading the
+collection). See [backlog.md](backlog.md).
 
 ## Cloud Functions triggers
 
