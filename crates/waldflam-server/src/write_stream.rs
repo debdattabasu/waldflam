@@ -73,6 +73,7 @@ where
                         database: db,
                         changes: applied.changes,
                         commit_us: now,
+                        origin: waldflam_engine::watch::Origin::Local,
                     });
                     let response = WriteResponse {
                         stream_token,

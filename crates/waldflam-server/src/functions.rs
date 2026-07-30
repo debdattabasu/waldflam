@@ -177,6 +177,13 @@ pub fn spawn_dispatcher(hub: Arc<WatchHub>, registry: Arc<TriggerRegistry>, pool
                 }
                 Err(_) => return,
             };
+            // Only the instance that applied the commit dispatches for it:
+            // every instance sees every commit, so acting on remote events
+            // too would deliver each CloudEvent once per instance. Remote
+            // events also lack the before-image `EventKind` classifies on.
+            if event.origin != waldflam_engine::watch::Origin::Local {
+                continue;
+            }
             if registry.is_empty() {
                 continue;
             }

@@ -80,6 +80,7 @@ impl FirestoreService {
             database: name.database.clone(),
             changes: applied.changes,
             commit_us: now,
+            origin: waldflam_engine::watch::Origin::Local,
         });
         Ok(Response::new(match result {
             Some(doc) => to_wire_document(name, doc),
@@ -446,6 +447,7 @@ impl Firestore for FirestoreService {
             database,
             changes: applied.changes,
             commit_us: now,
+            origin: waldflam_engine::watch::Origin::Local,
         });
         Ok(Response::new(CommitResponse {
             write_results: applied

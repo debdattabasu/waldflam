@@ -16,6 +16,7 @@
 //!   present, so every document has at least one entry.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mongodb::bson::spec::BinarySubtype;
 use mongodb::bson::{Binary, doc, to_bson};
@@ -61,15 +62,119 @@ pub struct StoredDocument {
     pub fields: HashMap<String, Value>,
 }
 
+/// Name of the shared collection every instance writes commit notices to and
+/// tails for other instances' commits.
+const EVENTS: &str = "_commit_events";
+
+/// How long a commit notice lives before MongoDB's TTL monitor reaps it.
+/// Only needs to outlast the moment a tailing instance reads it.
+const EVENT_TTL_SECONDS: u64 = 3600;
+
+/// A commit notice: which paths a commit touched, and who applied it.
+/// Deliberately payload-free — it stays small no matter how large the
+/// documents were, and readers fetch whatever state they actually need.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommitNotice {
+    pub instance: String,
+    pub project_id: String,
+    pub database_id: String,
+    pub commit_us: i64,
+    pub paths: Vec<String>,
+    /// TTL anchor; MongoDB reaps the notice once this passes.
+    pub expires_at: mongodb::bson::DateTime,
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Database,
+    /// Identifies this process's commits so the fan-out tail can skip the
+    /// ones it published itself (already delivered in-process).
+    instance_id: Arc<str>,
 }
 
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self, EngineError> {
         let client = Client::with_uri_str(uri).await?;
-        Ok(Self { db: client.database("waldflam") })
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let store = Self {
+            db: client.database("waldflam"),
+            instance_id: format!("{}-{nanos}", std::process::id()).into(),
+        };
+        store.ensure_event_ttl_index().await?;
+        Ok(store)
+    }
+
+    /// This process's identity in the shared event collection.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    fn events(&self) -> Collection<CommitNotice> {
+        self.db.collection(EVENTS)
+    }
+
+    /// Lets MongoDB reap old commit notices instead of growing forever.
+    /// Creating an index that already exists is a no-op.
+    async fn ensure_event_ttl_index(&self) -> Result<(), EngineError> {
+        let index = mongodb::IndexModel::builder()
+            .keys(doc! { "expires_at": 1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(std::time::Duration::from_secs(0))
+                    .build(),
+            )
+            .build();
+        self.events().create_index(index).await?;
+        Ok(())
+    }
+
+    /// Records what a commit touched, inside that commit's transaction — so
+    /// the notice becomes visible exactly when the writes do, and is rolled
+    /// back with them if the commit fails.
+    pub async fn append_commit_notice_in_session(
+        &self,
+        session: &mut ClientSession,
+        database: &DatabaseName,
+        commit_us: i64,
+        paths: Vec<String>,
+    ) -> Result<(), EngineError> {
+        let expires_at = mongodb::bson::DateTime::from_system_time(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(EVENT_TTL_SECONDS),
+        );
+        let notice = CommitNotice {
+            instance: self.instance_id.to_string(),
+            project_id: database.project_id.clone(),
+            database_id: database.database_id.clone(),
+            commit_us,
+            paths,
+            expires_at,
+        };
+        let events = self.events();
+        events.insert_one(notice).session(session).await?;
+        Ok(())
+    }
+
+    /// Tails commit notices from every instance. `resume_after` continues an
+    /// earlier stream so a reconnect doesn't skip commits.
+    pub async fn watch_commit_notices(
+        &self,
+        resume_after: Option<mongodb::change_stream::event::ResumeToken>,
+    ) -> Result<
+        mongodb::change_stream::ChangeStream<
+            mongodb::change_stream::event::ChangeStreamEvent<CommitNotice>,
+        >,
+        EngineError,
+    > {
+        let events = self.events();
+        let watch = events.watch();
+        let watch = match resume_after {
+            Some(token) => watch.resume_after(token),
+            None => watch,
+        };
+        Ok(watch.await?)
     }
 
     fn collection(&self, database: &DatabaseName) -> Collection<DocRow> {

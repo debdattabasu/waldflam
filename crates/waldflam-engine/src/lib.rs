@@ -8,6 +8,7 @@
 pub mod commit;
 pub mod encoding;
 pub mod error;
+pub mod fanout;
 pub mod fields;
 pub mod index_key;
 pub mod order;

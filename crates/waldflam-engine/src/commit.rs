@@ -164,6 +164,13 @@ async fn apply_in_transaction(
             }
         }
     }
+
+    // Publish inside the transaction: other instances learn about the commit
+    // exactly when its writes become visible, and never if it rolls back.
+    if !changes.is_empty() {
+        let paths = changes.iter().map(|delta| delta.path.to_string()).collect();
+        store.append_commit_notice_in_session(session, database, now_us, paths).await?;
+    }
     Ok(CommitApplied { outcomes, changes })
 }
 

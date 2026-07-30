@@ -1,10 +1,12 @@
-//! Commit-event fan-out for Listen streams.
+//! Commit-event fan-out for Listen streams and triggers.
 //!
 //! Every applied commit publishes the final state of each changed document;
 //! Listen streams subscribe and translate events into per-target changes.
 //!
-//! TODO(multi-instance): this is an in-process bus — all writes flow through
-//! this server. For horizontal scaling, back it with Mongo change streams.
+//! The bus itself is in-process, but it carries commits from the whole
+//! cluster: each commit also records the paths it touched to a shared
+//! collection, and `fanout` tails that collection and republishes other
+//! instances' commits here. See `Origin` for what that costs.
 
 use std::sync::Arc;
 
@@ -23,11 +25,31 @@ pub struct DocumentDelta {
     pub after: Option<StoredDocument>,
 }
 
+/// Which instance applied the commit this event describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Applied here. Deltas are exact: `before` and `after` are the states
+    /// the commit actually moved between.
+    Local,
+    /// Applied by another instance and learned from the shared event
+    /// collection, which records only the paths a commit touched. `after` is
+    /// read back from storage (so it reflects current state, not necessarily
+    /// the state at that commit) and `before` is always `None`.
+    ///
+    /// That is enough for Listen, which needs `after` for document targets
+    /// and only the paths for query targets. It is *not* enough for
+    /// triggers, which classify create/update/delete from `before`. Triggers
+    /// therefore only act on `Local` events — which is also what keeps each
+    /// CloudEvent delivered once cluster-wide instead of once per instance.
+    Remote,
+}
+
 #[derive(Debug)]
 pub struct CommitEvent {
     pub database: DatabaseName,
     pub changes: Vec<DocumentDelta>,
     pub commit_us: i64,
+    pub origin: Origin,
 }
 
 #[derive(Debug)]

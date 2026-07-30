@@ -19,10 +19,13 @@ use crate::service::FirestoreService;
 /// native gRPC over h2c (all SDKs in emulator mode), REST v1 in proto3-JSON
 /// (JS lite + browser unary), and a health check at `/`.
 pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
-    let svc = Arc::new(FirestoreService::new(store));
+    let svc = Arc::new(FirestoreService::new(store.clone()));
     let pool = rest::descriptor_pool();
     let triggers: Arc<functions::TriggerRegistry> = Default::default();
     functions::spawn_dispatcher(svc.hub_handle(), triggers.clone(), pool.clone());
+    // Republishes other instances' commits onto this instance's hub, so
+    // Listen streams here see writes applied anywhere in the cluster.
+    waldflam_engine::fanout::spawn(store, svc.hub_handle());
     let rest_state =
         rest::RestState { svc: svc.clone(), pool, sessions: Default::default(), triggers };
 
