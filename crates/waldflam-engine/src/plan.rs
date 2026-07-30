@@ -9,6 +9,12 @@
 //! superset, and anything that can't be translated confidently is skipped —
 //! a skipped filter just isn't part of the predicate.
 //!
+//! **`Plan::exact` is a stronger claim** and is tracked separately: it says
+//! the predicate matches the query's documents precisely, which is what lets
+//! ordering and paging move into MongoDB. Widening a clause is always safe
+//! for the predicate but must clear `exact`, or a server-side `limit` will
+//! count documents the in-memory pass is about to reject.
+//!
 //! The index keys make this work: `index_key::encode_value` is
 //! order-preserving across the whole cross-type ordering, so equality is byte
 //! equality and Firestore's ranges are sub-ranges of Mongo's.
@@ -30,17 +36,58 @@ use waldflam_proto::v1::value::ValueType;
 
 use crate::index_key::{encode_value, to_index_string};
 
-/// Builds the `$and` predicate for a flattened filter list, or `None` when
-/// nothing could be translated (the caller then scans as before).
-pub fn mongo_predicate(filters: &[&FilterType]) -> Option<Document> {
-    let clauses: Vec<Document> = filters.iter().filter_map(|f| clause_for(f)).collect();
-    if clauses.is_empty() {
-        return None;
-    }
-    Some(doc! { "$and": clauses })
+/// A translated filter list.
+pub struct Plan {
+    /// The `$and` predicate, or `None` when nothing could be translated.
+    pub predicate: Option<Document>,
+    /// Whether the predicate matches *exactly* the documents the query does,
+    /// rather than a superset.
+    ///
+    /// This is what licenses pushing `sort`/`skip`/`limit` into MongoDB. On a
+    /// merely-sound predicate a server-side `limit: 10` could return ten
+    /// candidates of which the in-memory pass rejects three — silently
+    /// answering seven when more matches existed further down. Exact means
+    /// nothing gets rejected afterwards, so the window is safe to apply early.
+    pub exact: bool,
 }
 
-fn clause_for(filter: &FilterType) -> Option<Document> {
+/// Builds the predicate for a flattened filter list. `order_paths` are the
+/// normalized order-by fields, which Firestore requires to be present — an
+/// exact condition, and one that has to be part of the predicate before a
+/// window can be pushed down.
+pub fn plan(filters: &[&FilterType], order_paths: &[&str]) -> Plan {
+    let mut clauses = Vec::new();
+    let mut exact = true;
+    for filter in filters {
+        match clause_for(filter) {
+            Some((clause, clause_exact)) => {
+                clauses.push(clause);
+                exact &= clause_exact;
+            }
+            // Untranslatable: everything still matches, so the predicate is
+            // wider than the query.
+            None => exact = false,
+        }
+    }
+    for path in order_paths {
+        // `__name__` is always present; anything else must exist to sort by.
+        if *path != "__name__" && plain_path(path).is_some() {
+            clauses.push(exists(path));
+        } else if *path != "__name__" {
+            exact = false;
+        }
+    }
+    let predicate = (!clauses.is_empty()).then(|| doc! { "$and": clauses });
+    Plan { predicate, exact }
+}
+
+/// Convenience for callers that only want the predicate.
+pub fn mongo_predicate(filters: &[&FilterType]) -> Option<Document> {
+    plan(filters, &[]).predicate
+}
+
+/// Returns the clause and whether it is exact (as opposed to a superset).
+fn clause_for(filter: &FilterType) -> Option<(Document, bool)> {
     match filter {
         FilterType::FieldFilter(f) => {
             let path = plain_path(f.field.as_ref()?.field_path.as_str())?;
@@ -53,42 +100,29 @@ fn clause_for(filter: &FilterType) -> Option<Document> {
                 // encode a value that means something else in index space.
                 FieldOp::Equal => {
                     reject_null_nan(operand)?;
-                    Some(entry(&path, "v", key(operand).into()))
+                    Some((entry(&path, "v", key(operand).into()), true))
                 }
-                // Superset: Firestore inequalities are type-bounded, Mongo's
-                // range is not, so lower/higher type ranks come along and get
-                // trimmed in memory. The bound itself can stay strict —
-                // distinct values never share a key, so nothing that should
-                // match sits exactly on it.
-                FieldOp::LessThan => {
-                    reject_null_nan(operand)?;
-                    Some(entry(&path, "v", doc! { "$lt": key(operand) }.into()))
-                }
-                FieldOp::LessThanOrEqual => {
-                    reject_null_nan(operand)?;
-                    Some(entry(&path, "v", doc! { "$lte": key(operand) }.into()))
-                }
-                FieldOp::GreaterThan => {
-                    reject_null_nan(operand)?;
-                    Some(entry(&path, "v", doc! { "$gt": key(operand) }.into()))
-                }
-                FieldOp::GreaterThanOrEqual => {
-                    reject_null_nan(operand)?;
-                    Some(entry(&path, "v", doc! { "$gte": key(operand) }.into()))
-                }
+                // Type-bounded on both sides, so exact — see `range`.
+                FieldOp::LessThan => range(&path, operand, "$lt"),
+                FieldOp::LessThanOrEqual => range(&path, operand, "$lte"),
+                FieldOp::GreaterThan => range(&path, operand, "$gt"),
+                FieldOp::GreaterThanOrEqual => range(&path, operand, "$gte"),
                 // Array membership rides the per-element "e" entries.
                 FieldOp::ArrayContains => {
                     reject_null_nan(operand)?;
-                    Some(entry(&path, "e", key(operand).into()))
+                    Some((entry(&path, "e", key(operand).into()), true))
                 }
                 FieldOp::ArrayContainsAny => {
-                    Some(entry(&path, "e", doc! { "$in": key_set(operand)? }.into()))
+                    Some((entry(&path, "e", doc! { "$in": key_set(operand)? }.into()), true))
                 }
-                FieldOp::In => Some(entry(&path, "v", doc! { "$in": key_set(operand)? }.into())),
+                FieldOp::In => {
+                    Some((entry(&path, "v", doc! { "$in": key_set(operand)? }.into()), true))
+                }
                 // Negations: the most we can say cheaply is that the field
                 // has to exist at all, which Firestore also requires. The
-                // in-memory pass does the actual exclusion.
-                FieldOp::NotEqual | FieldOp::NotIn => Some(exists(&path)),
+                // in-memory pass does the actual exclusion, so this is a
+                // superset.
+                FieldOp::NotEqual | FieldOp::NotIn => Some((exists(&path), false)),
                 FieldOp::Unspecified => None,
             }
         }
@@ -98,16 +132,44 @@ fn clause_for(filter: &FilterType) -> Option<Document> {
             };
             let path = plain_path(&field.field_path)?;
             match u.op() {
-                UnaryOp::IsNull => Some(entry(&path, "v", key(&null_value()).into())),
-                UnaryOp::IsNan => Some(entry(&path, "v", key(&nan_value()).into())),
-                // "not null" / "not NaN" still require the field to exist.
-                UnaryOp::IsNotNull | UnaryOp::IsNotNan => Some(exists(&path)),
+                UnaryOp::IsNull => Some((entry(&path, "v", key(&null_value()).into()), true)),
+                UnaryOp::IsNan => Some((entry(&path, "v", key(&nan_value()).into()), true)),
+                // "not null" / "not NaN" still require the field to exist,
+                // which is all we can say — a superset.
+                UnaryOp::IsNotNull | UnaryOp::IsNotNan => Some((exists(&path), false)),
                 UnaryOp::Unspecified => None,
             }
         }
         // run_query flattens AND trees before planning, and rejects OR.
         FilterType::CompositeFilter(_) => None,
     }
+}
+
+/// A type-bounded range. Firestore inequalities only compare within one type,
+/// and an encoded key starts with its type's tag byte — so confining the key
+/// to that tag's span *is* that rule, which makes the clause exact rather
+/// than a superset, and so eligible for window pushdown.
+fn range(path: &str, operand: &Value, op: &str) -> Option<(Document, bool)> {
+    reject_null_nan(operand)?;
+    let bound = key(operand);
+    let tag = bound.get(0..2)?.to_owned();
+    let mut cond = Document::new();
+    cond.insert(op, &bound);
+    if op == "$lt" || op == "$lte" {
+        if is_number(operand) {
+            // NaN is a number but never satisfies an inequality, and it
+            // encodes below every real one — so flooring just above it both
+            // excludes NaN and keeps the range inside the number tag.
+            cond.insert("$gt", key(&nan_value()));
+        } else {
+            cond.insert("$gte", &tag);
+        }
+    } else {
+        // Ceiling at the next tag value; no real type tag lands on tag + 1.
+        let next = u8::from_str_radix(&tag, 16).ok()? + 1;
+        cond.insert("$lt", format!("{next:02x}"));
+    }
+    Some((entry(path, "v", cond.into()), true))
 }
 
 /// Matches documents having an index entry for `path` of kind `kind` whose
@@ -156,6 +218,11 @@ fn is_null(v: &Value) -> bool {
 
 fn is_nan(v: &Value) -> bool {
     matches!(v.value_type, Some(ValueType::DoubleValue(d)) if d.is_nan())
+}
+
+/// Integers and doubles share one type rank, and one index tag.
+fn is_number(v: &Value) -> bool {
+    matches!(v.value_type, Some(ValueType::IntegerValue(_)) | Some(ValueType::DoubleValue(_)))
 }
 
 fn null_value() -> Value {

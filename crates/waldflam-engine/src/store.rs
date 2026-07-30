@@ -84,6 +84,20 @@ pub struct CommitNotice {
     pub expires_at: mongodb::bson::DateTime,
 }
 
+/// Server-side ordering and paging for a query whose predicate is exact.
+///
+/// Only safe on an exact predicate: applying `limit` before the in-memory
+/// pass would otherwise truncate a candidate set that still contains
+/// non-matches. See `plan::Plan::exact`.
+#[derive(Debug, Clone)]
+pub struct SortWindow {
+    /// Normalized order-by, as (field path, ascending). Always ends with
+    /// `__name__`, so the order is total.
+    pub order_by: Vec<(String, bool)>,
+    pub skip: i64,
+    pub limit: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Database,
@@ -293,7 +307,7 @@ impl Store {
         database: &DatabaseName,
         collection_path: &ResourcePath,
     ) -> Result<Vec<StoredDocument>, EngineError> {
-        self.list_collection_where(database, collection_path, None).await
+        self.list_collection_where(database, collection_path, None, None).await
     }
 
     /// As `list_collection`, narrowed by an index predicate from `plan`.
@@ -303,11 +317,12 @@ impl Store {
         database: &DatabaseName,
         collection_path: &ResourcePath,
         predicate: Option<BsonDocument>,
+        window: Option<SortWindow>,
     ) -> Result<Vec<StoredDocument>, EngineError> {
         let filter = self
             .narrowed(database, doc! { "collection_path": collection_path.to_string() }, predicate)
             .await?;
-        self.collect_rows(self.collection(database).find(filter).await?).await
+        self.fetch(database, filter, window).await
     }
 
     /// All documents in every collection with this id (collection group).
@@ -316,7 +331,7 @@ impl Store {
         database: &DatabaseName,
         collection_id: &str,
     ) -> Result<Vec<StoredDocument>, EngineError> {
-        self.list_collection_group_where(database, collection_id, None).await
+        self.list_collection_group_where(database, collection_id, None, None).await
     }
 
     /// As `list_collection_group`, narrowed by an index predicate.
@@ -325,10 +340,61 @@ impl Store {
         database: &DatabaseName,
         collection_id: &str,
         predicate: Option<BsonDocument>,
+        window: Option<SortWindow>,
     ) -> Result<Vec<StoredDocument>, EngineError> {
         let filter =
             self.narrowed(database, doc! { "collection_id": collection_id }, predicate).await?;
-        self.collect_rows(self.collection(database).find(filter).await?).await
+        self.fetch(database, filter, window).await
+    }
+
+    /// Runs `filter`, optionally ordering and truncating server-side.
+    ///
+    /// Without a window this is a plain `find`. With one it becomes an
+    /// aggregation that lifts each order-by field's index key out of the
+    /// `indexed` array and sorts on it — the keys are order-preserving, so
+    /// sorting by key is sorting by value — then applies `$skip`/`$limit` so
+    /// only the requested page crosses the wire.
+    async fn fetch(
+        &self,
+        database: &DatabaseName,
+        filter: BsonDocument,
+        window: Option<SortWindow>,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        let Some(window) = window else {
+            return self.collect_rows(self.collection(database).find(filter).await?).await;
+        };
+
+        let mut extract = BsonDocument::new();
+        let mut sort = BsonDocument::new();
+        let mut temporaries = Vec::new();
+        for (i, (path, ascending)) in window.order_by.iter().enumerate() {
+            let alias = format!("__sort{i}");
+            extract.insert(
+                &alias,
+                doc! { "$first": { "$filter": {
+                    "input": "$indexed",
+                    "cond": { "$and": [
+                        { "$eq": ["$$this.p", path] },
+                        { "$eq": ["$$this.k", "v"] },
+                    ] },
+                } } },
+            );
+            sort.insert(format!("{alias}.v"), if *ascending { 1 } else { -1 });
+            temporaries.push(alias);
+        }
+
+        let mut stages = vec![doc! { "$match": filter }, doc! { "$addFields": extract }];
+        stages.push(doc! { "$sort": sort });
+        if window.skip > 0 {
+            stages.push(doc! { "$skip": window.skip });
+        }
+        if let Some(limit) = window.limit {
+            stages.push(doc! { "$limit": limit });
+        }
+        stages.push(doc! { "$unset": temporaries });
+
+        let cursor = self.collection(database).aggregate(stages).with_type::<DocRow>().await?;
+        self.collect_rows(cursor).await
     }
 
     /// Folds an index predicate into a base filter, ensuring the indexes that

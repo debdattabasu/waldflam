@@ -70,7 +70,21 @@ async fn evaluate(
     if let Some(filter) = query.r#where.as_ref() {
         flatten_and(filter, &mut filters)?;
     }
-    let predicate = planned.then(|| crate::plan::mongo_predicate(&filters)).flatten();
+
+    // Normalized order-bys: explicit, then inequality fields, then __name__.
+    // Computed before fetching, because the predicate has to require those
+    // fields to exist before ordering and paging can move server-side.
+    let orders = normalize_orders(query, &filters);
+
+    let (predicate, window) = if planned {
+        let order_paths: Vec<&str> = orders.iter().map(order_path).collect();
+        let plan = crate::plan::plan(&filters, &order_paths);
+        let window = pushdown_window(query, &orders, plan.exact);
+        (plan.predicate, window)
+    } else {
+        (None, None)
+    };
+    let paged_by_mongo = window.is_some();
 
     // Candidate set: narrowed by the index where the planner could, whole
     // collection where it couldn't.
@@ -78,17 +92,18 @@ async fn evaluate(
         if !parent.is_empty() {
             return Err(EngineError::Unimplemented("collection-group queries below the root"));
         }
-        store.list_collection_group_where(database, &selector.collection_id, predicate).await?
+        store
+            .list_collection_group_where(database, &selector.collection_id, predicate, window)
+            .await?
     } else {
         let collection = parent.child(&selector.collection_id)?;
-        store.list_collection_where(database, &collection, predicate).await?
+        store.list_collection_where(database, &collection, predicate, window).await?
     };
 
-    // Exact semantics over the candidates.
+    // Exact semantics over the candidates. A no-op when the window was pushed
+    // down (that requires an exact predicate), but the source of truth
+    // otherwise.
     docs.retain(|doc| filters.iter().all(|f| matches_filter(database, doc, f)));
-
-    // Normalized order-bys: explicit, then inequality fields, then __name__.
-    let orders = normalize_orders(query, &filters);
 
     // Order-by fields must exist (except __name__).
     docs.retain(|doc| {
@@ -117,14 +132,53 @@ async fn evaluate(
         });
     }
 
-    // Offset / limit.
-    if query.offset > 0 {
-        docs.drain(..(query.offset as usize).min(docs.len()));
-    }
-    if let Some(limit) = query.limit {
-        docs.truncate(limit.max(0) as usize);
+    // Offset / limit — unless MongoDB already applied them.
+    if !paged_by_mongo {
+        if query.offset > 0 {
+            docs.drain(..(query.offset as usize).min(docs.len()));
+        }
+        if let Some(limit) = query.limit {
+            docs.truncate(limit.max(0) as usize);
+        }
     }
     Ok(docs)
+}
+
+/// Decides whether ordering and paging can move into MongoDB.
+///
+/// Requires an exact predicate: on a merely-sound one, a server-side `limit`
+/// would truncate a set that still contains documents the in-memory pass
+/// rejects, quietly returning short. Cursors stay in memory because they
+/// compare against order-by *values*, and there is no point paying for an
+/// aggregation when nothing gets truncated.
+fn pushdown_window(
+    query: &StructuredQuery,
+    orders: &[Order],
+    exact: bool,
+) -> Option<crate::store::SortWindow> {
+    if !exact || query.start_at.is_some() || query.end_at.is_some() {
+        return None;
+    }
+    // A non-positive limit means "no results"; the in-memory path handles
+    // that without asking MongoDB for an illegal `$limit: 0`.
+    if query.limit.is_some_and(|limit| limit <= 0) {
+        return None;
+    }
+    let limit = query.limit.map(i64::from);
+    if limit.is_none() && query.offset <= 0 {
+        return None;
+    }
+    Some(crate::store::SortWindow {
+        order_by: orders
+            .iter()
+            .map(|order| {
+                let ascending = order.direction != Direction::Descending as i32;
+                (order_path(order).to_owned(), ascending)
+            })
+            .collect(),
+        skip: i64::from(query.offset.max(0)),
+        limit,
+    })
 }
 
 /// Computes aggregation results over an already-evaluated result set.

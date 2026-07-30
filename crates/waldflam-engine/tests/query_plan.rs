@@ -16,7 +16,7 @@ use waldflam_proto::v1::structured_query::field_filter::Operator as FieldOp;
 use waldflam_proto::v1::structured_query::filter::FilterType;
 use waldflam_proto::v1::structured_query::unary_filter::{OperandType, Operator as UnaryOp};
 use waldflam_proto::v1::structured_query::{
-    CollectionSelector, FieldFilter, FieldReference, Filter, UnaryFilter,
+    CollectionSelector, Direction, FieldFilter, FieldReference, Filter, Order, UnaryFilter,
 };
 use waldflam_proto::v1::value::ValueType;
 use waldflam_proto::v1::write::Operation;
@@ -184,6 +184,102 @@ fn shapes() -> Vec<(&'static str, Option<Filter>)> {
     ]
 }
 
+fn order(path: &str, ascending: bool) -> Order {
+    Order {
+        field: Some(FieldReference { field_path: path.into() }),
+        direction: if ascending { Direction::Ascending } else { Direction::Descending } as i32,
+    }
+}
+
+/// Query shapes that reach the sort/skip/limit pushdown — the ones with a
+/// window to push. Ordering and paging move into MongoDB only when the
+/// predicate is exact, so these deliberately mix exact filters (which push)
+/// with inexact ones like `!=` (which must not), and check both come back
+/// identical to scanning.
+#[allow(clippy::type_complexity)]
+fn windowed_shapes() -> Vec<(&'static str, Option<Filter>, Vec<Order>, Option<i32>, i32)> {
+    vec![
+        ("order n asc, limit 5", None, vec![order("n", true)], Some(5), 0),
+        ("order n desc, limit 5", None, vec![order("n", false)], Some(5), 0),
+        ("order n asc, offset 5 limit 5", None, vec![order("n", true)], Some(5), 5),
+        ("order n asc, offset only", None, vec![order("n", true)], None, 30),
+        ("order name asc, limit 3 (missing on some)", None, vec![order("name", true)], Some(3), 0),
+        ("order __name__ desc, limit 4", None, vec![order("__name__", false)], Some(4), 0),
+        (
+            "multi-field order, limit 7",
+            None,
+            vec![order("meta.group", true), order("n", false)],
+            Some(7),
+            0,
+        ),
+        // Mixed int/double storage must order as one number type.
+        ("order mixed asc, limit 6", None, vec![order("mixed", true)], Some(6), 0),
+        // Exact filters: these push.
+        (
+            "eq + order + limit",
+            Some(field_filter("even", FieldOp::Equal, val(ValueType::BooleanValue(true)))),
+            vec![order("n", true)],
+            Some(4),
+            0,
+        ),
+        (
+            "array-contains + order + limit",
+            Some(field_filter("tags", FieldOp::ArrayContains, string("all"))),
+            vec![order("n", false)],
+            Some(6),
+            2,
+        ),
+        (
+            "in + order + limit",
+            Some(field_filter("n", FieldOp::In, array(vec![int(3), int(8), int(21)]))),
+            vec![order("n", true)],
+            Some(2),
+            0,
+        ),
+        // Type-bounded ranges are exact too, so these push.
+        (
+            "range + order + limit",
+            Some(field_filter("n", FieldOp::GreaterThanOrEqual, int(10))),
+            vec![order("n", true)],
+            Some(5),
+            0,
+        ),
+        (
+            "range desc + order + limit",
+            Some(field_filter("n", FieldOp::LessThan, int(25))),
+            vec![order("n", false)],
+            Some(5),
+            3,
+        ),
+        (
+            "string range + order + limit",
+            Some(field_filter("name", FieldOp::GreaterThan, string("doc-20"))),
+            vec![order("name", true)],
+            Some(4),
+            0,
+        ),
+        // Inexact filters: must fall back rather than truncate early.
+        (
+            "not-equal + order + limit",
+            Some(field_filter("n", FieldOp::NotEqual, int(5))),
+            vec![order("n", true)],
+            Some(5),
+            0,
+        ),
+        (
+            "is-not-null + order + limit",
+            Some(unary_filter("maybe", UnaryOp::IsNotNull)),
+            vec![order("n", true)],
+            Some(3),
+            0,
+        ),
+        // Degenerate windows.
+        ("limit 0", None, vec![order("n", true)], Some(0), 0),
+        ("limit past the end", None, vec![order("n", true)], Some(500), 0),
+        ("offset past the end", None, vec![order("n", true)], Some(5), 500),
+    ]
+}
+
 /// The soundness invariant: planning may only reduce I/O, never results.
 #[tokio::test]
 async fn planning_returns_exactly_what_scanning_returns() {
@@ -208,6 +304,82 @@ async fn planning_returns_exactly_what_scanning_returns() {
     // Guards against the whole corpus silently matching nothing, which would
     // make every comparison above trivially true.
     assert!(checked_nonempty >= 20, "only {checked_nonempty} shapes matched anything");
+}
+
+/// Ordering and paging pushed into MongoDB must select the same page the
+/// in-memory pipeline would. This is the sharp end: the server-side `$sort`
+/// runs on index keys lifted out of the `indexed` array, so a wrong
+/// extraction, a flipped direction, or a limit applied to a merely-sound
+/// predicate all show up as a different page.
+#[tokio::test]
+async fn pushed_down_windows_select_the_same_page() {
+    let store = store().await;
+    let db = test_db("windows");
+    seed(&store, &db, "items").await;
+    let root = ResourcePath::parse("").unwrap();
+
+    for (label, filter, order_by, limit, offset) in windowed_shapes() {
+        let query = StructuredQuery {
+            from: vec![CollectionSelector {
+                collection_id: "items".into(),
+                all_descendants: false,
+            }],
+            r#where: filter,
+            order_by,
+            limit,
+            offset,
+            ..Default::default()
+        };
+        let planned = run_query(&store, &db, &root, &query).await.expect(label);
+        let scanned = run_query_scanning(&store, &db, &root, &query).await.expect(label);
+
+        // Order matters here, not just membership — this is a paged query.
+        let planned: Vec<String> = planned.iter().map(|d| d.path.to_string()).collect();
+        let scanned: Vec<String> = scanned.iter().map(|d| d.path.to_string()).collect();
+        assert_eq!(planned, scanned, "pushdown changed the page for `{label}`");
+    }
+}
+
+/// The differential tests only mean something if the window actually moves
+/// server-side, and it only moves when the predicate is exact. Pin that
+/// classification down directly, so a regression that quietly stops pushing
+/// (or starts pushing when it shouldn't) fails here rather than going unseen.
+#[test]
+fn exactness_gates_pushdown_where_expected() {
+    let exact_cases: Vec<(&str, FilterType)> = vec![
+        ("equality", filter_type(field_filter("n", FieldOp::Equal, int(7)))),
+        ("array-contains", filter_type(field_filter("tags", FieldOp::ArrayContains, string("a")))),
+        ("in", filter_type(field_filter("n", FieldOp::In, array(vec![int(1), int(2)])))),
+        ("range", filter_type(field_filter("n", FieldOp::GreaterThan, int(3)))),
+        ("string range", filter_type(field_filter("s", FieldOp::LessThanOrEqual, string("m")))),
+        ("is-null", filter_type(unary_filter("maybe", UnaryOp::IsNull))),
+        ("is-nan", filter_type(unary_filter("maybe", UnaryOp::IsNan))),
+    ];
+    for (label, filter) in &exact_cases {
+        let plan = waldflam_engine::plan::plan(&[filter], &["__name__"]);
+        assert!(plan.exact, "`{label}` should be exact, so a window can be pushed");
+        assert!(plan.predicate.is_some(), "`{label}` should produce a predicate");
+    }
+
+    let inexact_cases: Vec<(&str, FilterType)> = vec![
+        ("not-equal", filter_type(field_filter("n", FieldOp::NotEqual, int(7)))),
+        ("not-in", filter_type(field_filter("n", FieldOp::NotIn, array(vec![int(1)])))),
+        ("is-not-null", filter_type(unary_filter("maybe", UnaryOp::IsNotNull))),
+        ("is-not-nan", filter_type(unary_filter("maybe", UnaryOp::IsNotNan))),
+        // Null and NaN operands never match, so nothing is translated at all.
+        (
+            "null operand",
+            filter_type(field_filter("n", FieldOp::Equal, val(ValueType::NullValue(0)))),
+        ),
+    ];
+    for (label, filter) in &inexact_cases {
+        let plan = waldflam_engine::plan::plan(&[filter], &["__name__"]);
+        assert!(!plan.exact, "`{label}` is a superset, so no window may be pushed");
+    }
+}
+
+fn filter_type(filter: Filter) -> FilterType {
+    filter.filter_type.expect("constructed with a filter type")
 }
 
 /// Being correct is not the point on its own — the predicate has to be served

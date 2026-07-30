@@ -42,13 +42,22 @@ These are the ones to fix before calling waldflam production-ready.
   point-in-time read silently get latest state. Firestore keeps history; we
   overwrite in place. Fix needs a versioned storage design — non-trivial, and
   worth deciding whether to support at all.
-- **Sorting, cursors, and limits still happen in memory.** Filters are pushed
-  into MongoDB (`waldflam-engine/src/plan.rs`), so a query no longer reads the
-  whole collection — but every candidate that survives the predicate is still
-  fetched, sorted, and truncated in the server. A query whose *filters* are
-  broad but whose `limit` is small therefore reads far more than it returns.
-  Fix: push `sort` + `limit` down too, which needs an index key per
-  normalized order-by rather than the unordered `indexed` array.
+- **Cursor queries still read every candidate.** Ordering and paging move
+  into MongoDB only when the predicate is exact and the query has no
+  `start_at`/`end_at` (`query::pushdown_window`). Cursors compare against
+  order-by *values*, so they stay in memory — meaning a cursor-paged query
+  fetches every matching document to return one page. Fix: translate cursor
+  positions into key ranges on the same extracted sort keys.
+- **Inexact predicates can't be paged server-side.** `!=`, `not-in`,
+  `is-not-null`, `is-not-nan` and anything untranslatable leave the predicate
+  wider than the query, so `limit` has to stay in memory or it would count
+  documents the exact pass is about to reject. Those queries still read all
+  candidates.
+- **The pushed-down sort is not index-backed.** It sorts on keys lifted out
+  of the `indexed` array with `$addFields`, which no index covers, so MongoDB
+  does a top-K sort. Far better than shipping every candidate to the server —
+  but a stored per-order-by key column would let an index provide the order
+  directly.
 - **Some filters can't be planned and still scan.** `!=` and `not-in` narrow
   only to "field exists"; `OR` isn't supported at all; backtick-escaped field
   paths are skipped deliberately, since a dotted path is ambiguous between a
