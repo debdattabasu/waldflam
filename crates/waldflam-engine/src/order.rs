@@ -1,7 +1,7 @@
 //! Firestore's total order over values.
 //!
 //! The server must sort exactly like the client-side comparators (the Go
-//! SDK's `order.go` is the extracted spec), or watch snapshots and cursors
+//! SDK's `order.go` states the same order), or watch snapshots and cursors
 //! break. Cross-type rank, then per-type comparison.
 
 use std::cmp::Ordering;

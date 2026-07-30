@@ -1,7 +1,7 @@
 //! Generated gRPC/protobuf types for the `google.firestore.v1` surface.
 //!
-//! Protos are vendored from the firebase-js-sdk checkout (which curates them
-//! from googleapis) so the wire surface matches what official clients speak.
+//! Protos are vendored from firebase-js-sdk (which curates them from
+//! googleapis) so the wire surface matches what official clients speak.
 
 pub mod google {
     pub mod api {
