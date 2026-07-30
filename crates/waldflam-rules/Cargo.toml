@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+regex = "1"
