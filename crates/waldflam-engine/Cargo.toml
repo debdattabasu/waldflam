@@ -12,6 +12,7 @@ mongodb = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

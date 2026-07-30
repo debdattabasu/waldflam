@@ -14,5 +14,6 @@ pub mod order;
 pub mod path;
 pub mod query;
 pub mod store;
+pub mod txn;
 
 pub use error::EngineError;

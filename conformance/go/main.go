@@ -93,6 +93,8 @@ func main() {
 	}
 	fmt.Println("DELETE ok")
 
+	runTransactionChecks(ctx, client)
+
 	fmt.Println("ALL GO CLIENT CHECKS PASSED")
 	os.Exit(0)
 }

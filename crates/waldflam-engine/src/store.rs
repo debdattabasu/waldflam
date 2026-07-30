@@ -158,6 +158,35 @@ impl Store {
         .await
     }
 
+    /// Distinct collection ids directly under `parent` (the documents root
+    /// or a document path).
+    pub async fn list_collection_ids(
+        &self,
+        database: &DatabaseName,
+        parent: &ResourcePath,
+    ) -> Result<Vec<String>, EngineError> {
+        let paths = self
+            .collection(database)
+            .distinct("collection_path", doc! {})
+            .await?;
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        let mut ids: Vec<String> = paths
+            .into_iter()
+            .filter_map(|p| p.as_str().map(str::to_owned))
+            .filter_map(|p| {
+                let rest = p.strip_prefix(&prefix)?;
+                // Directly under the parent = exactly one remaining segment.
+                (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_owned())
+            })
+            .collect();
+        ids.dedup();
+        Ok(ids)
+    }
+
     async fn collect_rows(
         &self,
         mut cursor: mongodb::Cursor<DocRow>,
