@@ -265,7 +265,7 @@ pub(crate) fn status_response(status: &Status) -> Response {
         .into_response()
 }
 
-/// The emulator's gRPC→HTTP mapping (docs/architecture.md §11).
+/// gRPC→HTTP status mapping (docs/architecture.md §11).
 fn http_code(code: tonic::Code) -> (StatusCode, &'static str) {
     use tonic::Code::*;
     match code {

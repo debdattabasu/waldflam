@@ -1,4 +1,4 @@
-//! Spec tests. Each case encodes a behavior extracted in
+//! Spec tests. Each case encodes a behavior specified in
 //! docs/architecture.md §7 — these are the semantics that make a rules
 //! engine correct rather than merely plausible.
 
