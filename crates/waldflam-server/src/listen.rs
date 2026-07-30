@@ -36,6 +36,8 @@ struct TargetState {
 
 pub struct ListenSession {
     store: Store,
+    auth: crate::auth::Authorization,
+    rules: Arc<crate::rules::RulesRegistry>,
     database: Option<DatabaseName>,
     targets: HashMap<i32, TargetState>,
     next_server_target_id: i32,
@@ -46,6 +48,8 @@ pub struct ListenSession {
 pub fn spawn<S>(
     store: Store,
     hub: Arc<WatchHub>,
+    auth: crate::auth::Authorization,
+    rules: Arc<crate::rules::RulesRegistry>,
     mut requests: S,
 ) -> ReceiverStream<Result<ListenResponse, Status>>
 where
@@ -54,6 +58,8 @@ where
     let (tx, rx) = mpsc::channel(256);
     let mut session = ListenSession {
         store,
+        auth,
+        rules,
         database: None,
         targets: HashMap::new(),
         next_server_target_id: 1_000_000,
@@ -213,6 +219,46 @@ impl ListenSession {
         self.send_initial_state(id).await
     }
 
+    /// Rules check for one document read on this stream.
+    async fn may_read(
+        &self,
+        database: &DatabaseName,
+        path: &ResourcePath,
+        doc: Option<&StoredDocument>,
+    ) -> bool {
+        crate::rules::check(
+            &self.rules,
+            &self.store,
+            &self.auth,
+            crate::rules::AccessRequest {
+                database,
+                path,
+                operation: waldflam_rules::Operation::Get,
+                incoming: None,
+                existing: doc,
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Rules denial for a target: `TargetChange{REMOVE, cause}` — the
+    /// client surfaces it as a per-listener error, leaving the stream up.
+    async fn deny_target(&mut self, id: i32) -> Flow {
+        self.targets.remove(&id);
+        self.send(listen_response::ResponseType::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Remove as i32,
+            target_ids: vec![id],
+            cause: Some(waldflam_proto::google::rpc::Status {
+                code: tonic::Code::PermissionDenied as i32,
+                message: "Missing or insufficient permissions.".into(),
+                details: Vec::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+    }
+
     /// Full state for one target: doc changes/deletes, CURRENT, snapshot.
     async fn send_initial_state(&mut self, id: i32) -> Flow {
         let database = self.database.clone().expect("database set");
@@ -221,16 +267,52 @@ impl ListenSession {
         let mut missing = Vec::new();
         match &state.kind {
             TargetKind::Documents(paths) => {
-                for path in paths {
+                let paths = paths.clone();
+                for path in &paths {
                     match self.store.get_document(&database, path).await {
-                        Ok(Some(doc)) => found.push(doc),
-                        Ok(None) => missing.push(path.clone()),
+                        Ok(Some(doc)) => {
+                            if !self.may_read(&database, path, Some(&doc)).await {
+                                return self.deny_target(id).await;
+                            }
+                            found.push(doc);
+                        }
+                        Ok(None) => {
+                            if !self.may_read(&database, path, None).await {
+                                return self.deny_target(id).await;
+                            }
+                            missing.push(path.clone());
+                        }
                         Err(e) => return Err(Some(Status::internal(e.to_string()))),
                     }
                 }
             }
             TargetKind::Query { parent, query } => {
-                match waldflam_engine::query::run_query(&self.store, &database, parent, query)
+                let (parent, query) = (parent.clone(), query.clone());
+                // Query targets need `list` on the collection.
+                let collection = query
+                    .from
+                    .first()
+                    .and_then(|selector| parent.child(&selector.collection_id).ok());
+                if let Some(collection) = collection {
+                    let allowed = crate::rules::check(
+                        &self.rules,
+                        &self.store,
+                        &self.auth,
+                        crate::rules::AccessRequest {
+                            database: &database,
+                            path: &collection,
+                            operation: waldflam_rules::Operation::List,
+                            incoming: None,
+                            existing: None,
+                        },
+                    )
+                    .await
+                    .is_ok();
+                    if !allowed {
+                        return self.deny_target(id).await;
+                    }
+                }
+                match waldflam_engine::query::run_query(&self.store, &database, &parent, &query)
                     .await
                 {
                     Ok(docs) => found = docs,

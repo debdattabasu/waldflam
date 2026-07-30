@@ -178,6 +178,25 @@ fn unknown_sid() -> Response {
     (StatusCode::BAD_REQUEST, "Error: Unknown SID").into_response()
 }
 
+/// Extracts credentials from the handshake body's `headers=` block:
+/// an HTTP/1.1-style CRLF-separated header list, URL-encoded whole.
+fn auth_from_body(body: &[u8]) -> crate::auth::Authorization {
+    let fields: HashMap<String, String> = form_urlencoded::parse(body)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let Some(block) = fields.get("headers") else {
+        return crate::auth::Authorization::Unauthenticated;
+    };
+    let header = block.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_owned())
+    });
+    crate::auth::Authorization::from_header(header.as_deref())
+        .unwrap_or(crate::auth::Authorization::Unauthenticated)
+}
+
 /// Decodes the `count`/`ofs`/`req{i}___data__` form body into raw JSON
 /// message strings, in order.
 fn decode_forward_body(body: &[u8]) -> Vec<String> {
@@ -217,6 +236,7 @@ async fn handshake(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Response {
+    let auth = auth_from_body(body);
     let sid = format!(
         "wf{}-{:x}",
         state.sessions.counter.fetch_add(1, Ordering::Relaxed),
@@ -232,6 +252,8 @@ async fn handshake(
                 let stream = crate::listen::spawn(
                     state.svc.store_handle(),
                     state.svc.hub_handle(),
+                    auth.clone(),
+                    state.svc.rules.clone(),
                     ReceiverStream::new(rx),
                 );
                 let (jtx, jrx) = mpsc::channel(64);
@@ -244,6 +266,8 @@ async fn handshake(
                     state.svc.store_handle(),
                     state.svc.hub_handle(),
                     state.svc.txns_handle(),
+                    auth.clone(),
+                    state.svc.rules.clone(),
                     ReceiverStream::new(rx),
                 );
                 let (jtx, jrx) = mpsc::channel(64);

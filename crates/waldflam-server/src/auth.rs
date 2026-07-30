@@ -33,6 +33,14 @@ pub struct JwtClaims {
 }
 
 impl Authorization {
+    /// Extracts credentials from gRPC request metadata.
+    pub fn from_metadata(metadata: &tonic::metadata::MetadataMap) -> Result<Self, Status> {
+        let header = metadata
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        Self::from_header(header)
+    }
+
     /// Parses an `authorization` header value (or its absence).
     pub fn from_header(header: Option<&str>) -> Result<Self, Status> {
         let Some(header) = header else {

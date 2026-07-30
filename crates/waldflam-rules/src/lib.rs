@@ -14,8 +14,9 @@ pub mod stdlib;
 pub mod value;
 
 pub use ast::{Ruleset, Version};
+pub use eval::Fatal;
 pub use eval::{Evaluator, Host, Scope};
-pub use matcher::{Decision, Operation, evaluate};
+pub use matcher::{Decision, Operation, WILDCARD_SEGMENT, evaluate};
 pub use parser::{Issue, parse};
 pub use value::Value;
 

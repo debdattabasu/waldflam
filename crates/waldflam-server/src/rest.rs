@@ -174,6 +174,57 @@ pub async fn health() -> &'static str {
     "Ok\n"
 }
 
+/// `PUT /emulator/v1/projects/{project}:securityRules` — the endpoint
+/// `@firebase/rules-unit-testing` uses to load rules. Body:
+/// `{"rules": {"files": [{"name": ..., "content": "<rules source>"}]}}`.
+pub async fn set_security_rules(
+    State(state): State<RestState>,
+    Path(project): Path<String>,
+    body: Bytes,
+) -> Response {
+    let project = project.trim_end_matches(":securityRules");
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return status_response(&Status::invalid_argument(format!("invalid JSON: {e}")));
+        }
+    };
+    let source = parsed
+        .pointer("/rules/files/0/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let ruleset = match waldflam_rules::parse(source) {
+        Ok(r) => r,
+        Err(issue) => {
+            // Match the emulator's compile-error shape.
+            return status_response(&Status::invalid_argument(format!(
+                "Error compiling rules:\nL{}:{} {}",
+                issue.line, issue.col, issue.message
+            )));
+        }
+    };
+    // Rules are per-database; the admin API is per-project, so apply to the
+    // default database.
+    let database = waldflam_engine::path::DatabaseName::new(project, "(default)");
+    state.svc.rules.set(&database, ruleset);
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], "{}").into_response()
+}
+
+/// `DELETE /emulator/v1/projects/{project}/databases/{db}/documents` —
+/// clears all data (test-harness reset).
+pub async fn clear_data(
+    State(state): State<RestState>,
+    Path((project, database)): Path<(String, String)>,
+) -> Response {
+    let db = waldflam_engine::path::DatabaseName::new(project, database);
+    match state.svc.store_handle().clear_database(&db).await {
+        Ok(()) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], "{}").into_response()
+        }
+        Err(e) => status_response(&Status::internal(e.to_string())),
+    }
+}
+
 pub(crate) fn status_response(status: &Status) -> Response {
     let (http, name) = http_code(status.code());
     let body = serde_json::json!({

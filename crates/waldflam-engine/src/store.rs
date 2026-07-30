@@ -199,6 +199,12 @@ impl Store {
         Ok(out)
     }
 
+    /// Drops every document in a database (admin/test reset).
+    pub async fn clear_database(&self, database: &DatabaseName) -> Result<(), EngineError> {
+        self.collection(database).drop().await?;
+        Ok(())
+    }
+
     /// Returns whether the document existed.
     pub async fn delete_document(
         &self,

@@ -19,3 +19,8 @@ Three flavors, all unchanged:
 
 Each exercises set/get, transforms, queries, count aggregation, optimistic
 transactions, the full onSnapshot realtime lifecycle, and deletes.
+
+`node rules.mjs` covers security rules end to end: loading a ruleset over
+the emulator admin API, admin bypass (`Bearer owner`), anonymous vs
+authenticated access, `exists()` lookups inside rules, query (`list`)
+enforcement, and the clear-data endpoint.

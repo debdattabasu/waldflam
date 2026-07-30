@@ -22,6 +22,8 @@ pub fn spawn<S>(
     store: Store,
     hub: Arc<WatchHub>,
     txns: Arc<TransactionManager>,
+    auth: crate::auth::Authorization,
+    rules: Arc<crate::rules::RulesRegistry>,
     mut requests: S,
 ) -> ReceiverStream<Result<WriteResponse, Status>>
 where
@@ -53,6 +55,13 @@ where
                     return;
                 }
                 continue;
+            }
+
+            if let Err(status) =
+                crate::rules::check_writes(&rules, &store, &auth, &db, &req.writes).await
+            {
+                let _ = tx.send(Err(status)).await;
+                return;
             }
 
             let now = now_us();

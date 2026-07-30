@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod listen;
 pub mod rest;
+pub mod rules;
 pub mod service;
 pub mod webchannel;
 pub mod write_stream;
@@ -28,6 +29,14 @@ pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
     let rest_router = axum::Router::new()
         .route("/", axum::routing::get(rest::health))
         .route("/v1/{*path}", axum::routing::post(rest::v1_post))
+        .route(
+            "/emulator/v1/projects/{project}",
+            axum::routing::put(rest::set_security_rules),
+        )
+        .route(
+            "/emulator/v1/projects/{project}/databases/{database}/documents",
+            axum::routing::delete(rest::clear_data),
+        )
         .with_state(rest_state.clone());
     let router = grpc
         .into_axum_router()

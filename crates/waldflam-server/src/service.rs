@@ -16,11 +16,42 @@ pub struct FirestoreService {
     store: Store,
     txns: std::sync::Arc<waldflam_engine::txn::TransactionManager>,
     hub: std::sync::Arc<waldflam_engine::watch::WatchHub>,
+    pub rules: std::sync::Arc<crate::rules::RulesRegistry>,
 }
 
 impl FirestoreService {
     pub fn new(store: Store) -> Self {
-        Self { store, txns: Default::default(), hub: Default::default() }
+        Self {
+            store,
+            txns: Default::default(),
+            hub: Default::default(),
+            rules: Default::default(),
+        }
+    }
+
+    /// Rules enforcement for one document access.
+    async fn check_access(
+        &self,
+        auth: &crate::auth::Authorization,
+        database: &DatabaseName,
+        path: &waldflam_engine::path::ResourcePath,
+        operation: waldflam_rules::Operation,
+        incoming: Option<&Document>,
+        existing: Option<&waldflam_engine::store::StoredDocument>,
+    ) -> Result<(), Status> {
+        crate::rules::check(
+            &self.rules,
+            &self.store,
+            auth,
+            crate::rules::AccessRequest {
+                database,
+                path,
+                operation,
+                incoming,
+                existing,
+            },
+        )
+        .await
     }
 
     pub fn store_handle(&self) -> Store {
@@ -181,6 +212,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<GetDocumentRequest>,
     ) -> Result<Response<Document>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let req = request.into_inner();
         let not_found = || Status::not_found(format!("Document ({}) not found.", req.name));
         // Anything with a valid database prefix that isn't a document path
@@ -207,6 +239,15 @@ impl Firestore for FirestoreService {
             self.txns.record_read(token, name.path.to_string(), version);
         }
         let doc = doc.ok_or_else(not_found)?;
+        self.check_access(
+            &auth,
+            &name.database,
+            &name.path,
+            waldflam_rules::Operation::Get,
+            None,
+            Some(&doc),
+        )
+        .await?;
         Ok(Response::new(to_wire_document(&name, doc)))
     }
 
@@ -319,6 +360,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<BatchGetDocumentsRequest>,
     ) -> Result<Response<Self::BatchGetDocumentsStream>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let req = request.into_inner();
         let database = DatabaseName::parse(&req.database)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -356,6 +398,17 @@ impl Firestore for FirestoreService {
                 let version = doc.as_ref().map(|d| d.update_time_us).unwrap_or(0);
                 self.txns.record_read(token, parsed.path.to_string(), version);
             }
+            if let Some(found) = doc.as_ref() {
+                self.check_access(
+                    &auth,
+                    &database,
+                    &parsed.path,
+                    waldflam_rules::Operation::Get,
+                    None,
+                    Some(found),
+                )
+                .await?;
+            }
             let result = match doc {
                 Some(doc) => batch_get_documents_response::Result::Found(
                     to_wire_document(&parsed, doc),
@@ -391,10 +444,14 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let req = request.into_inner();
         let database = DatabaseName::parse(&req.database)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let now = now_us();
+
+        crate::rules::check_writes(&self.rules, &self.store, &auth, &database, &req.writes)
+            .await?;
 
         // The commit lock serializes validate+apply across all commits so a
         // transaction can't be invalidated between its validation and write.
@@ -449,6 +506,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<Self::RunQueryStream>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let req = request.into_inner();
         let parent = ResourceName::parse(&req.parent)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -464,6 +522,21 @@ impl Firestore for FirestoreService {
             }
             _ => (None, None), // TODO(consistency): read_time sees latest
         };
+        if let Some(selector) = query.from.first() {
+            let collection = parent
+                .path
+                .child(&selector.collection_id)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            self.check_access(
+                &auth,
+                &parent.database,
+                &collection,
+                waldflam_rules::Operation::List,
+                None,
+                None,
+            )
+            .await?;
+        }
         let docs =
             waldflam_engine::query::run_query(&self.store, &parent.database, &parent.path, &query)
                 .await
@@ -564,10 +637,13 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let stream = crate::write_stream::spawn(
             self.store.clone(),
             self.hub.clone(),
             self.txns.clone(),
+            auth,
+            self.rules.clone(),
             request.into_inner(),
         );
         Ok(Response::new(Box::pin(stream)))
@@ -577,9 +653,12 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>, Status> {
+        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
         let stream = crate::listen::spawn(
             self.store.clone(),
             self.hub.clone(),
+            auth,
+            self.rules.clone(),
             request.into_inner(),
         );
         Ok(Response::new(Box::pin(stream)))

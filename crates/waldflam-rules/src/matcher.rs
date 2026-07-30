@@ -12,6 +12,13 @@ use crate::ast::*;
 use crate::eval::{Evaluator, Fatal, Host, Scope};
 use crate::value::Value;
 
+/// Sentinel segment for `list` evaluation: a query is authorized against
+/// the collection path plus an unspecified document. Captures matching it
+/// bind to undefined (the reference implementation leaves them unbound), so
+/// a rule that depends on the document id denies rather than matching a
+/// fabricated value.
+pub const WILDCARD_SEGMENT: &str = "\u{0}*";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Get,
@@ -176,7 +183,12 @@ fn match_segments(
             }
             MatchSeg::Capture(name) => {
                 let value = path.get(i)?;
-                captures.push((name.clone(), Value::str(value.as_str())));
+                let bound = if value == WILDCARD_SEGMENT {
+                    Value::undefined("unbound path capture")
+                } else {
+                    Value::str(value.as_str())
+                };
+                captures.push((name.clone(), bound));
                 i += 1;
             }
             MatchSeg::Glob(name) => {
