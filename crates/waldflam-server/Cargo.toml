@@ -24,6 +24,7 @@ base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 form_urlencoded = "1"
 prost = { workspace = true }
 prost-reflect = { version = "0.16", features = ["serde"] }

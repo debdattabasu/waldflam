@@ -372,8 +372,8 @@ impl ListenSession {
                     let watched: Vec<(ResourcePath, Option<StoredDocument>)> = event
                         .changes
                         .iter()
-                        .filter(|(p, _)| paths.contains(p))
-                        .cloned()
+                        .filter(|delta| paths.contains(&delta.path))
+                        .map(|delta| (delta.path.clone(), delta.after.clone()))
                         .collect();
                     for (path, new_state) in watched {
                         any_change = true;
@@ -409,7 +409,7 @@ impl ListenSession {
                     if !event
                         .changes
                         .iter()
-                        .any(|(p, _)| query_may_cover(parent, query, p))
+                        .any(|delta| query_may_cover(parent, query, &delta.path))
                     {
                         continue;
                     }

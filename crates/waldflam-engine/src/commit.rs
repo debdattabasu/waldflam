@@ -37,13 +37,15 @@ pub struct WriteOutcome {
 #[derive(Debug)]
 pub struct CommitApplied {
     pub outcomes: Vec<WriteOutcome>,
-    pub changes: Vec<(ResourcePath, Option<crate::store::StoredDocument>)>,
+    pub changes: Vec<crate::watch::DocumentDelta>,
 }
 
 #[derive(Debug, Clone)]
 struct DocState {
     /// (create_time_us, update_time_us, fields) when the doc exists.
     current: Option<(i64, i64, HashMap<String, Value>)>,
+    /// State as loaded, for trigger before-images.
+    before: Option<crate::store::StoredDocument>,
     dirty: bool,
 }
 
@@ -61,11 +63,11 @@ pub async fn apply_commit(
         let path = write_target(database, write)?;
         let key = path.to_string();
         if !states.contains_key(&key) {
-            let current = store
-                .get_document(database, &path)
-                .await?
-                .map(|d| (d.create_time_us, d.update_time_us, d.fields));
-            states.insert(key, DocState { current, dirty: false });
+            let loaded = store.get_document(database, &path).await?;
+            let current = loaded
+                .as_ref()
+                .map(|d| (d.create_time_us, d.update_time_us, d.fields.clone()));
+            states.insert(key, DocState { current, before: loaded, dirty: false });
         }
     }
 
@@ -87,14 +89,19 @@ pub async fn apply_commit(
             continue;
         }
         state.dirty = false;
+        let before = state.before.clone();
         match &state.current {
             Some((_, _, fields)) => {
                 let stored = store.set_document(database, &path, fields.clone(), now_us).await?;
-                changes.push((path, Some(stored)));
+                changes.push(crate::watch::DocumentDelta {
+                    path,
+                    before,
+                    after: Some(stored),
+                });
             }
             None => {
                 store.delete_document(database, &path).await?;
-                changes.push((path, None));
+                changes.push(crate::watch::DocumentDelta { path, before, after: None });
             }
         }
     }
@@ -391,6 +398,7 @@ mod tests {
         let cur = array_value(vec![int_value(1), int_value(2)]);
         let mut state = DocState {
             current: Some((0, 0, HashMap::new())),
+            before: None,
             dirty: false,
         };
         state.current.as_mut().unwrap().2.insert("a".into(), cur);

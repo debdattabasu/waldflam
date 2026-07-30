@@ -13,11 +13,20 @@ use tokio::sync::broadcast;
 use crate::path::{DatabaseName, ResourcePath};
 use crate::store::StoredDocument;
 
+/// One document's transition in a commit.
+#[derive(Debug, Clone)]
+pub struct DocumentDelta {
+    pub path: ResourcePath,
+    /// State before the commit; `None` = the document did not exist.
+    pub before: Option<StoredDocument>,
+    /// State after the commit; `None` = deleted.
+    pub after: Option<StoredDocument>,
+}
+
 #[derive(Debug)]
 pub struct CommitEvent {
     pub database: DatabaseName,
-    /// Final state per changed document; `None` = deleted.
-    pub changes: Vec<(ResourcePath, Option<StoredDocument>)>,
+    pub changes: Vec<DocumentDelta>,
     pub commit_us: i64,
 }
 

@@ -20,6 +20,11 @@ Three flavors, all unchanged:
 Each exercises set/get, transforms, queries, count aggregation, optimistic
 transactions, the full onSnapshot realtime lifecycle, and deletes.
 
+`node triggers.mjs` covers Cloud Functions triggers: registering handlers
+over the admin API, then asserting create/update/delete CloudEvents arrive
+at a local HTTP server with the right types, before/after payloads, and path
+params.
+
 `node rules.mjs` covers security rules end to end: loading a ruleset over
 the emulator admin API, admin bypass (`Bearer owner`), anonymous vs
 authenticated access, `exists()` lookups inside rules, query (`list`)

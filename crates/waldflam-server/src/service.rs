@@ -85,8 +85,8 @@ impl FirestoreService {
         let result = applied
             .changes
             .iter()
-            .find(|(p, _)| *p == name.path)
-            .and_then(|(_, doc)| doc.clone());
+            .find(|delta| delta.path == name.path)
+            .and_then(|delta| delta.after.clone());
         self.hub.publish(waldflam_engine::watch::CommitEvent {
             database: name.database.clone(),
             changes: applied.changes,

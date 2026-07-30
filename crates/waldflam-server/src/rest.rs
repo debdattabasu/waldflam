@@ -27,6 +27,7 @@ pub struct RestState {
     pub svc: std::sync::Arc<FirestoreService>,
     pub pool: DescriptorPool,
     pub sessions: std::sync::Arc<crate::webchannel::WebChannelSessions>,
+    pub triggers: std::sync::Arc<crate::functions::TriggerRegistry>,
 }
 
 pub fn descriptor_pool() -> DescriptorPool {
@@ -208,6 +209,28 @@ pub async fn set_security_rules(
     let database = waldflam_engine::path::DatabaseName::new(project, "(default)");
     state.svc.rules.set(&database, ruleset);
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], "{}").into_response()
+}
+
+/// `PUT /emulator/v1/projects/{project}/triggers` — registers Cloud
+/// Functions triggers. Body: `{"triggers": [{id, pattern, event, endpoint}]}`.
+pub async fn set_triggers(State(state): State<RestState>, body: Bytes) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        triggers: Vec<crate::functions::TriggerSpec>,
+    }
+    match serde_json::from_slice::<Body>(&body) {
+        Ok(parsed) => {
+            let count = parsed.triggers.len();
+            state.triggers.replace(parsed.triggers);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "registered": count }).to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => status_response(&Status::invalid_argument(format!("invalid triggers: {e}"))),
+    }
 }
 
 /// `DELETE /emulator/v1/projects/{project}/databases/{db}/documents` —

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod functions;
 pub mod listen;
 pub mod rest;
 pub mod rules;
@@ -19,10 +20,14 @@ use crate::service::FirestoreService;
 /// (JS lite + browser unary), and a health check at `/`.
 pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
     let svc = Arc::new(FirestoreService::new(store));
+    let pool = rest::descriptor_pool();
+    let triggers: Arc<functions::TriggerRegistry> = Default::default();
+    functions::spawn_dispatcher(svc.hub_handle(), triggers.clone(), pool.clone());
     let rest_state = rest::RestState {
         svc: svc.clone(),
-        pool: rest::descriptor_pool(),
+        pool,
         sessions: Default::default(),
+        triggers,
     };
 
     let grpc = tonic::service::Routes::new(FirestoreServer::from_arc(svc));
@@ -36,6 +41,10 @@ pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
         .route(
             "/emulator/v1/projects/{project}/databases/{database}/documents",
             axum::routing::delete(rest::clear_data),
+        )
+        .route(
+            "/emulator/v1/projects/{project}/triggers",
+            axum::routing::put(rest::set_triggers),
         )
         .with_state(rest_state.clone());
     let router = grpc
