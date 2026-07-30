@@ -54,6 +54,28 @@ These are the ones to fix before calling waldflam production-ready.
   paths are skipped deliberately, since a dotted path is ambiguous between a
   nested map and a field whose name contains a dot. Each of these falls back
   to a collection scan plus in-memory filtering, which is correct but slow.
+- **Multi-filter queries only get single-field selectivity — there are no
+  composite indexes.** All index entries live in one array per document, and
+  MongoDB derives bounds from a single `$elemMatch` per index scan. A query
+  with two filters therefore seeks on one of them and filters the rest during
+  FETCH. Measured on `even == true AND n > 30` over 40 documents: 20 keys
+  examined, 20 documents fetched, 16 returned — the `n > 30` clause
+  contributed nothing.
+
+  This is the design's ceiling, not a bug to patch. A composite index needs
+  one key per *query shape*, holding the fields' encodings concatenated in
+  order; the single attribute-pattern array structurally cannot provide that.
+  Firestore resolves it by making composite indexes user-declared
+  (`firestore.indexes.json`) while single-field indexing stays automatic —
+  and waldflam already has the automatic half.
+
+  Whether to follow suit is an open product decision, and worth taking
+  deliberately: honouring `firestore.indexes.json` would match Firestore
+  exactly and let users tune, at the cost of the "no indexes to declare"
+  property that motivated this storage design. Deriving indexes from observed
+  query shapes instead would keep that property but adds a whole adaptive
+  indexing subsystem. Until one is chosen, selective multi-filter queries
+  over large collections are the weak spot.
 - **No document-size, depth, or path-length limits.** Firestore rejects
   documents over 1 MiB, nesting past 20/50 levels, path segments over 1500
   bytes, and paths over 100 segments. Constants are recorded in

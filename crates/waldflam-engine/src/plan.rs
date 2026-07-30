@@ -12,6 +12,14 @@
 //! The index keys make this work: `index_key::encode_value` is
 //! order-preserving across the whole cross-type ordering, so equality is byte
 //! equality and Firestore's ranges are sub-ranges of Mongo's.
+//!
+//! **Only one clause is selective.** MongoDB applies one `$elemMatch` per
+//! index scan, so with several filters it seeks on one and applies the rest
+//! while fetching. Emitting all of them is still worth it — the planner
+//! picks, and the others narrow nothing but cost nothing — but no arrangement
+//! of clauses here makes a second filter selective. That needs a composite
+//! index keyed per query shape, which the single `indexed` array cannot
+//! express; see architecture.md §9 and backlog.md.
 
 use mongodb::bson::{Bson, Document, doc};
 use waldflam_proto::v1::Value;

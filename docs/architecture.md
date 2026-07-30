@@ -408,7 +408,8 @@ Where the design lives in the code:
 | Trigger registry + dispatcher | `waldflam-server/src/functions.rs` |
 | Emulator-mode auth | `waldflam-server/src/auth.rs` |
 
-Three things the design didn't anticipate, found by running real clients:
+Four things the design didn't anticipate, three found by running real clients
+and one by measuring query plans:
 
 1. **The JS full SDK reads single documents via `Listen`, not
    `BatchGetDocuments`, and writes via the `Write` stream, not `Commit`.**
@@ -421,6 +422,23 @@ Three things the design didn't anticipate, found by running real clients:
 3. **Mongo compares BSON `BinData` by length first**, so variable-length
    memcomparable keys cannot be stored as binary; index keys are lowercase-hex
    strings, which compare bytewise.
+4. **The attribute pattern indexes one field per scan, not several.** §6
+   planned `$indexedFields` as a per-field object; as built, index entries are
+   one array of `{p, k, v}` triples per document (`store.rs`), which is what
+   makes indexing automatic and sparse — a field that isn't present has no
+   entry, and no schema has to be known in advance.
+
+   The cost shows up in the query plan. MongoDB derives index bounds on
+   several keys of the *same* array only when the query uses `$elemMatch`
+   (without it the value column degrades to `[MinKey, MaxKey]`), and it
+   applies one `$elemMatch` per index scan. So the compound index
+   `{collection_path, indexed.p, indexed.v}` gives an exact seek for a single
+   filter, while a second filter contributes nothing to selectivity and is
+   applied during FETCH. True composite indexes would need one key per query
+   shape holding the fields' encodings concatenated — which this structure
+   cannot express, and which is precisely why Firestore has users declare
+   composite indexes while single-field indexing stays automatic. Tracked in
+   [backlog.md](backlog.md).
 
 ## 10. Questions research resolved
 
