@@ -6,6 +6,7 @@
 //! See docs/architecture.md §6.
 
 pub mod commit;
+pub mod credentials;
 pub mod encoding;
 pub mod error;
 pub mod fanout;

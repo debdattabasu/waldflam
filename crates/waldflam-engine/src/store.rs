@@ -141,6 +141,12 @@ impl Store {
         &self.instance_id
     }
 
+    /// The underlying Mongo database, for sibling modules that keep their own
+    /// collections (credentials).
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
+    }
+
     fn events(&self) -> Collection<CommitNotice> {
         self.db.collection(EVENTS)
     }
