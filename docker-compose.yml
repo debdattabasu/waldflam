@@ -1,0 +1,19 @@
+# MongoDB as a single-node replica set: change streams and multi-document
+# transactions (both load-bearing for waldflam) require a replica set.
+services:
+  mongo:
+    image: mongo:8
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: |
+        mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate().ok }" | grep -q 1
+      interval: 5s
+      timeout: 10s
+      retries: 12
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
