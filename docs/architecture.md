@@ -394,7 +394,7 @@ Where the design lives in the code:
 | Mongo storage, index entries | `waldflam-engine/src/store.rs` |
 | Commit: preconditions, masks, transforms, one Mongo transaction per batch | `waldflam-engine/src/commit.rs` |
 | Query evaluation, aggregations | `waldflam-engine/src/query.rs` |
-| Filter + sort/limit pushdown into Mongo | `waldflam-engine/src/plan.rs` |
+| Filter / sort / cursor / limit pushdown into Mongo | `waldflam-engine/src/plan.rs` |
 | Transactions (optimistic read-set) | `waldflam-engine/src/txn.rs` |
 | Commit-event hub (watch + triggers) | `waldflam-engine/src/watch.rs` |
 | Cross-instance commit fan-out (change stream) | `waldflam-engine/src/fanout.rs` |

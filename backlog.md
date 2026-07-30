@@ -42,12 +42,6 @@ These are the ones to fix before calling waldflam production-ready.
   point-in-time read silently get latest state. Firestore keeps history; we
   overwrite in place. Fix needs a versioned storage design — non-trivial, and
   worth deciding whether to support at all.
-- **Cursor queries still read every candidate.** Ordering and paging move
-  into MongoDB only when the predicate is exact and the query has no
-  `start_at`/`end_at` (`query::pushdown_window`). Cursors compare against
-  order-by *values*, so they stay in memory — meaning a cursor-paged query
-  fetches every matching document to return one page. Fix: translate cursor
-  positions into key ranges on the same extracted sort keys.
 - **Inexact predicates can't be paged server-side.** `!=`, `not-in`,
   `is-not-null`, `is-not-nan` and anything untranslatable leave the predicate
   wider than the query, so `limit` has to stay in memory or it would count

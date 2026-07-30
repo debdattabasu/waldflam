@@ -85,6 +85,96 @@ pub fn mongo_predicate(filters: &[&FilterType]) -> Option<Document> {
     plan(filters, &[]).predicate
 }
 
+/// Adds clauses to a predicate's `$and`.
+pub fn conjoin(predicate: Option<Document>, extra: Vec<Document>) -> Option<Document> {
+    if extra.is_empty() {
+        return predicate;
+    }
+    let mut clauses = Vec::new();
+    if let Some(existing) = predicate {
+        let nested: Option<Vec<Document>> = existing
+            .get_array("$and")
+            .ok()
+            .map(|array| array.iter().filter_map(|item| item.as_document().cloned()).collect());
+        match nested {
+            Some(inner) => clauses.extend(inner),
+            None => clauses.push(existing),
+        }
+    }
+    clauses.extend(extra);
+    Some(doc! { "$and": clauses })
+}
+
+/// Which side of the sort order a cursor bounds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// `start_at`: keep documents at or after the cursor.
+    After,
+    /// `end_at`: keep documents at or before it.
+    Before,
+}
+
+/// Keyset-pagination predicate: a document's sort tuple compared
+/// lexicographically against the cursor's, expanded into clauses MongoDB can
+/// serve from the same index that provides the order.
+///
+/// `columns` are the stored sort columns with their directions, `values` the
+/// cursor's positional values — possibly a prefix, which is why each branch
+/// pins the earlier columns to equality and compares only the next one:
+///
+/// ```text
+/// f1 > v1  OR  (f1 == v1 AND f2 > v2)  OR  (f1 == v1 AND f2 == v2 AND f3 > v3)
+/// ```
+///
+/// Exact — encoded keys order exactly as values do — so it leaves
+/// `Plan::exact` alone and a window may still be pushed alongside it.
+pub fn cursor_bound(
+    columns: &[(String, bool)],
+    values: &[Value],
+    inclusive: bool,
+    bound: Bound,
+) -> Option<Document> {
+    // An empty cursor degenerates (it matches everything or nothing
+    // depending on `before`); leave those to the in-memory pass.
+    if values.is_empty() || values.len() > columns.len() {
+        return None;
+    }
+    let after = bound == Bound::After;
+    let mut branches = Vec::new();
+    for (i, value) in values.iter().enumerate() {
+        let (column, ascending) = &columns[i];
+        // "Later in the sort" is a greater value ascending, a smaller one
+        // descending. Only the final comparison can be inclusive.
+        let last = i + 1 == values.len();
+        let op = match (after == *ascending, last && inclusive) {
+            (true, false) => "$gt",
+            (true, true) => "$gte",
+            (false, false) => "$lt",
+            (false, true) => "$lte",
+        };
+        let mut branch = Document::new();
+        for (earlier, earlier_value) in columns.iter().zip(values).take(i) {
+            branch.insert(&earlier.0, key(earlier_value));
+        }
+        let mut cond = Document::new();
+        cond.insert(op, key(value));
+        branch.insert(column, cond);
+        branches.push(branch);
+    }
+    // One column needs no disjunction, and that plan stays a plain index
+    // scan rather than a merge of them.
+    Some(if branches.len() == 1 {
+        branches.pop().expect("one branch")
+    } else {
+        doc! { "$or": branches }
+    })
+}
+
+/// Whether a field path can be mapped to a stored column unambiguously.
+pub fn is_plain_path(path: &str) -> bool {
+    plain_path(path).is_some()
+}
+
 /// Returns the clause and whether it is exact (as opposed to a superset).
 fn clause_for(filter: &FilterType) -> Option<(Document, bool)> {
     match filter {

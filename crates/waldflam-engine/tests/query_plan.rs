@@ -20,7 +20,7 @@ use waldflam_proto::v1::structured_query::{
 };
 use waldflam_proto::v1::value::ValueType;
 use waldflam_proto::v1::write::Operation;
-use waldflam_proto::v1::{ArrayValue, Document, StructuredQuery, Value, Write};
+use waldflam_proto::v1::{ArrayValue, Cursor, Document, StructuredQuery, Value, Write};
 
 fn uri() -> String {
     std::env::var("WALDFLAM_TEST_MONGO")
@@ -391,6 +391,190 @@ fn winning_plan(explain: &mongodb::bson::Document) -> String {
         .and_then(|planner| planner.get_document("winningPlan"))
         .expect("queryPlanner.winningPlan")
         .to_string()
+}
+
+fn reference(db: &DatabaseName, path: &str) -> Value {
+    val(ValueType::ReferenceValue(format!("{}/{}", db.documents_root(), path)))
+}
+
+fn cursor(values: Vec<Value>, before: bool) -> Cursor {
+    Cursor { values, before }
+}
+
+/// Cursor shapes. `before` is Firestore's "position before this value", so
+/// `start_at` includes it and `end_at` excludes it — the two cursors read
+/// oppositely from the same flag, which is exactly the kind of thing a
+/// differential test should pin down.
+#[allow(clippy::type_complexity)]
+fn cursor_shapes(
+    db: &DatabaseName,
+) -> Vec<(&'static str, Option<Filter>, Vec<Order>, Option<Cursor>, Option<Cursor>, Option<i32>)> {
+    vec![
+        (
+            "startAt(n=10) asc",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(10)], true)),
+            None,
+            Some(5),
+        ),
+        (
+            "startAfter(n=10) asc",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(10)], false)),
+            None,
+            Some(5),
+        ),
+        (
+            "endAt(n=10) asc",
+            None,
+            vec![order("n", true)],
+            None,
+            Some(cursor(vec![int(10)], false)),
+            Some(50),
+        ),
+        (
+            "endBefore(n=10) asc",
+            None,
+            vec![order("n", true)],
+            None,
+            Some(cursor(vec![int(10)], true)),
+            Some(50),
+        ),
+        (
+            "startAt + endAt window",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(10)], true)),
+            Some(cursor(vec![int(20)], false)),
+            Some(50),
+        ),
+        (
+            "startAt(n=30) desc",
+            None,
+            vec![order("n", false)],
+            Some(cursor(vec![int(30)], true)),
+            None,
+            Some(6),
+        ),
+        (
+            "endBefore(n=10) desc",
+            None,
+            vec![order("n", false)],
+            None,
+            Some(cursor(vec![int(10)], true)),
+            Some(50),
+        ),
+        // Two-value keyset cursor: the `$or` expansion, and what a client
+        // sends when paging from a document snapshot.
+        (
+            "startAfter(n=10, __name__=d10)",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(10), reference(db, "items/d10")], false)),
+            None,
+            Some(5),
+        ),
+        (
+            "startAt(n=10, __name__=d10) inclusive",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(10), reference(db, "items/d10")], true)),
+            None,
+            Some(5),
+        ),
+        // Cursor shorter than the normalized order-by.
+        (
+            "startAfter(group=1) with two orders",
+            None,
+            vec![order("meta.group", true), order("n", true)],
+            Some(cursor(vec![int(1)], false)),
+            None,
+            Some(8),
+        ),
+        (
+            "string cursor",
+            None,
+            vec![order("name", true)],
+            Some(cursor(vec![string("doc-15")], false)),
+            None,
+            Some(4),
+        ),
+        // With filters, exact and inexact.
+        (
+            "eq filter + startAfter",
+            Some(field_filter("even", FieldOp::Equal, val(ValueType::BooleanValue(true)))),
+            vec![order("n", true)],
+            Some(cursor(vec![int(10)], false)),
+            None,
+            Some(4),
+        ),
+        (
+            "range filter + startAt + endAt",
+            Some(field_filter("n", FieldOp::GreaterThanOrEqual, int(5))),
+            vec![order("n", true)],
+            Some(cursor(vec![int(12)], true)),
+            Some(cursor(vec![int(25)], false)),
+            Some(6),
+        ),
+        (
+            "inexact filter + cursor",
+            Some(field_filter("n", FieldOp::NotEqual, int(15))),
+            vec![order("n", true)],
+            Some(cursor(vec![int(10)], false)),
+            None,
+            Some(5),
+        ),
+        // Degenerate: an empty cursor must not be pushed.
+        (
+            "empty cursor values",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![], false)),
+            None,
+            Some(5),
+        ),
+        (
+            "no limit, cursor only",
+            None,
+            vec![order("n", true)],
+            Some(cursor(vec![int(35)], false)),
+            None,
+            None,
+        ),
+    ]
+}
+
+/// Cursor pagination pushed into MongoDB must select the same page the
+/// in-memory comparison would.
+#[tokio::test]
+async fn cursor_pages_match_scanning() {
+    let store = store().await;
+    let db = test_db("cursors");
+    seed(&store, &db, "items").await;
+    let root = ResourcePath::parse("").unwrap();
+
+    for (label, filter, order_by, start_at, end_at, limit) in cursor_shapes(&db) {
+        let query = StructuredQuery {
+            from: vec![CollectionSelector {
+                collection_id: "items".into(),
+                all_descendants: false,
+            }],
+            r#where: filter,
+            order_by,
+            start_at,
+            end_at,
+            limit,
+            ..Default::default()
+        };
+        let planned = run_query(&store, &db, &root, &query).await.expect(label);
+        let scanned = run_query_scanning(&store, &db, &root, &query).await.expect(label);
+
+        let planned: Vec<String> = planned.iter().map(|d| d.path.to_string()).collect();
+        let scanned: Vec<String> = scanned.iter().map(|d| d.path.to_string()).collect();
+        assert_eq!(planned, scanned, "cursor pushdown changed the page for `{label}`");
+    }
 }
 
 /// The point of storing sort keys as real fields: MongoDB must answer

@@ -79,8 +79,15 @@ async fn evaluate(
     let (predicate, window) = if planned {
         let order_paths: Vec<&str> = orders.iter().map(order_path).collect();
         let plan = crate::plan::plan(&filters, &order_paths);
-        let window = pushdown_window(query, &orders, plan.exact);
-        (plan.predicate, window)
+        let columns = sort_columns(&orders);
+        // `None` means a cursor is present but couldn't be expressed, which
+        // bars the window: MongoDB would apply `limit` before the cursor.
+        let cursors = cursor_clauses(query, &columns, &orders);
+        let window = match &cursors {
+            Some(_) => pushdown_window(query, &columns, plan.exact),
+            None => None,
+        };
+        (crate::plan::conjoin(plan.predicate, cursors.unwrap_or_default()), window)
     } else {
         (None, None)
     };
@@ -144,19 +151,63 @@ async fn evaluate(
     Ok(docs)
 }
 
+/// The normalized order-by as stored sort columns.
+fn sort_columns(orders: &[Order]) -> Vec<(String, bool)> {
+    orders
+        .iter()
+        .map(|order| {
+            let ascending = order.direction != Direction::Descending as i32;
+            (crate::plan::sort_field(order_path(order)), ascending)
+        })
+        .collect()
+}
+
+/// Translates `start_at`/`end_at` into keyset predicates.
+///
+/// `Some(clauses)` — possibly empty — means every cursor present was
+/// expressed exactly. `None` means one could not be, and the caller must not
+/// push a window: MongoDB would apply `limit` to a set the in-memory cursor
+/// filter is still going to trim.
+fn cursor_clauses(
+    query: &StructuredQuery,
+    columns: &[(String, bool)],
+    orders: &[Order],
+) -> Option<Vec<mongodb::bson::Document>> {
+    let cursors = [
+        (query.start_at.as_ref(), crate::plan::Bound::After),
+        (query.end_at.as_ref(), crate::plan::Bound::Before),
+    ];
+    if cursors.iter().all(|(cursor, _)| cursor.is_none()) {
+        return Some(Vec::new());
+    }
+    // A backtick-escaped order path has no unambiguous column, and guessing
+    // one could exclude matches.
+    if !orders.iter().all(|order| crate::plan::is_plain_path(order_path(order))) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (cursor, bound) in cursors {
+        let Some(cursor) = cursor else { continue };
+        // `before` means "position before this value", so it includes the
+        // value for a start bound and excludes it for an end bound.
+        let inclusive =
+            if bound == crate::plan::Bound::After { cursor.before } else { !cursor.before };
+        out.push(crate::plan::cursor_bound(columns, &cursor.values, inclusive, bound)?);
+    }
+    Some(out)
+}
+
 /// Decides whether ordering and paging can move into MongoDB.
 ///
 /// Requires an exact predicate: on a merely-sound one, a server-side `limit`
 /// would truncate a set that still contains documents the in-memory pass
-/// rejects, quietly returning short. Cursors stay in memory because they
-/// compare against order-by *values*, and there is no point paying for an
-/// aggregation when nothing gets truncated.
+/// rejects, quietly returning short.
 fn pushdown_window(
     query: &StructuredQuery,
-    orders: &[Order],
+    columns: &[(String, bool)],
     exact: bool,
 ) -> Option<crate::store::SortWindow> {
-    if !exact || query.start_at.is_some() || query.end_at.is_some() {
+    if !exact {
         return None;
     }
     // A non-positive limit means "no results"; the in-memory path handles
@@ -169,13 +220,7 @@ fn pushdown_window(
         return None;
     }
     Some(crate::store::SortWindow {
-        order_by: orders
-            .iter()
-            .map(|order| {
-                let ascending = order.direction != Direction::Descending as i32;
-                (crate::plan::sort_field(order_path(order)), ascending)
-            })
-            .collect(),
+        order_by: columns.to_vec(),
         skip: i64::from(query.offset.max(0)),
         limit,
     })

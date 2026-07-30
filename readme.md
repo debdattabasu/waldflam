@@ -66,11 +66,11 @@ streaming writes, security rules, and Cloud Functions triggers. Seven
 conformance suites in [conformance/](conformance/) prove it against a live
 server on every run.
 
-Still **pre-alpha for production**: cursor-paged queries still read every
-matching document, and JWTs are decoded but not verified (emulator
-semantics). Those and everything else known-missing are catalogued honestly
-in [backlog.md](backlog.md) — read it before deploying anything you care
-about.
+Still **pre-alpha for production**: JWTs are decoded but not verified
+(emulator semantics), and queries whose filters can't be expressed exactly —
+`!=`, `not-in`, `OR` — still page in the server rather than the database.
+Those and everything else known-missing are catalogued honestly in
+[backlog.md](backlog.md) — read it before deploying anything you care about.
 
 - [x] **M0 — scaffold**: workspace, full 17-RPC `google.firestore.v1` gRPC
   surface served on h2c, value ordering + resource-name parsing + emulator
@@ -91,16 +91,15 @@ about.
   events delivered as CloudEvents to your HTTP endpoints, with path-pattern
   params and before/after payloads
 
-Next up is depth rather than breadth — cursor pagination pushed down, then
-production auth. Three pieces already landed: commits are **atomic** (each
-runs in a MongoDB transaction, so a batch never half-lands and concurrent
-writers can't lose an update), waldflam runs **multi-instance** (every commit
-is announced through a change stream, so a listener on one instance sees
-writes applied on any of them), and queries are **index-backed** (filters
-become MongoDB predicates over the stored order-preserving keys, and when a
-predicate is exact the ordering and `limit` run server-side too, so a paged
-query ships one page rather than the whole match set). See
-[backlog.md](backlog.md).
+Next up is depth rather than breadth — production auth, then composite
+indexes. Three pieces already landed: commits are **atomic** (each runs in a
+MongoDB transaction, so a batch never half-lands and concurrent writers can't
+lose an update), waldflam runs **multi-instance** (every commit is announced
+through a change stream, so a listener on one instance sees writes applied on
+any of them), and queries are **index-backed end to end** — filters, ordering,
+cursors, and `limit` all become MongoDB predicates over stored
+order-preserving keys, so a paged query reads its page rather than the whole
+match set. See [backlog.md](backlog.md).
 
 ## Cloud Functions triggers
 
