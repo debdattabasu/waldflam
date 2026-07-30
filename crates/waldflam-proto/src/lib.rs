@@ -21,3 +21,8 @@ pub mod google {
 }
 
 pub use google::firestore::v1;
+
+/// Compiled descriptors for the whole surface — powers proto3-JSON
+/// transcoding on the REST endpoints.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
