@@ -1,0 +1,11 @@
+{
+  "name": "waldflam-jsconf",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node main.mjs"
+  },
+  "dependencies": {
+    "firebase": "^12.16.0"
+  }
+}
