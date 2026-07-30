@@ -47,6 +47,25 @@ fn authed<T>(message: T, headers: &HeaderMap) -> tonic::Request<T> {
     request
 }
 
+/// Guards the `/emulator/v1` endpoints, which load rules, register trigger
+/// callbacks, and erase whole databases.
+///
+/// The emulator leaves these open because it is a local development tool; a
+/// server anyone can reach must not, so verified mode requires admin. In
+/// emulator mode this is a no-op, keeping the SDK test harnesses working.
+async fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<(), Response> {
+    if !state.svc.auth.guards_admin_api() {
+        return Ok(());
+    }
+    let header = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
+    match state.svc.auth.authorize(header).await {
+        Ok(crate::auth::Authorization::Admin) => Ok(()),
+        _ => Err(status_response(&Status::permission_denied(
+            "admin credentials required for this endpoint",
+        ))),
+    }
+}
+
 pub fn descriptor_pool() -> DescriptorPool {
     DescriptorPool::decode(waldflam_proto::FILE_DESCRIPTOR_SET)
         .expect("embedded descriptors decode")
@@ -193,8 +212,12 @@ pub async fn health() -> &'static str {
 pub async fn set_security_rules(
     State(state): State<RestState>,
     Path(project): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(denied) = require_admin(&state, &headers).await {
+        return denied;
+    }
     let project = project.trim_end_matches(":securityRules");
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -223,7 +246,14 @@ pub async fn set_security_rules(
 
 /// `PUT /emulator/v1/projects/{project}/triggers` — registers Cloud
 /// Functions triggers. Body: `{"triggers": [{id, pattern, event, endpoint}]}`.
-pub async fn set_triggers(State(state): State<RestState>, body: Bytes) -> Response {
+pub async fn set_triggers(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(denied) = require_admin(&state, &headers).await {
+        return denied;
+    }
     #[derive(serde::Deserialize)]
     struct Body {
         triggers: Vec<crate::functions::TriggerSpec>,
@@ -248,7 +278,11 @@ pub async fn set_triggers(State(state): State<RestState>, body: Bytes) -> Respon
 pub async fn clear_data(
     State(state): State<RestState>,
     Path((project, database)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(denied) = require_admin(&state, &headers).await {
+        return denied;
+    }
     let db = waldflam_engine::path::DatabaseName::new(project, database);
     match state.svc.store_handle().clear_database(&db).await {
         Ok(()) => {

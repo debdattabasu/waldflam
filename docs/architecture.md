@@ -406,7 +406,7 @@ Where the design lives in the code:
 | WebChannel (S2) | `waldflam-server/src/webchannel.rs` |
 | Rules binding + enforcement | `waldflam-server/src/rules.rs` |
 | Trigger registry + dispatcher | `waldflam-server/src/functions.rs` |
-| Emulator-mode auth | `waldflam-server/src/auth.rs` |
+| Auth: emulator semantics + verified mode | `waldflam-server/src/auth.rs` |
 
 Four things the design didn't anticipate, three found by running real clients
 and one by measuring query plans:

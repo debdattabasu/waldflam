@@ -14,6 +14,7 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 /// by milestone (docs/architecture.md §9).
 pub struct FirestoreService {
     store: Store,
+    pub auth: crate::auth::AuthPolicy,
     txns: std::sync::Arc<waldflam_engine::txn::TransactionManager>,
     hub: std::sync::Arc<waldflam_engine::watch::WatchHub>,
     pub rules: std::sync::Arc<crate::rules::RulesRegistry>,
@@ -21,7 +22,17 @@ pub struct FirestoreService {
 
 impl FirestoreService {
     pub fn new(store: Store) -> Self {
-        Self { store, txns: Default::default(), hub: Default::default(), rules: Default::default() }
+        Self::with_auth(store, crate::auth::AuthPolicy::default())
+    }
+
+    pub fn with_auth(store: Store, auth: crate::auth::AuthPolicy) -> Self {
+        Self {
+            store,
+            auth,
+            txns: Default::default(),
+            hub: Default::default(),
+            rules: Default::default(),
+        }
     }
 
     /// Rules enforcement for one document access.
@@ -198,7 +209,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<GetDocumentRequest>,
     ) -> Result<Response<Document>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let not_found = || Status::not_found(format!("Document ({}) not found.", req.name));
         // Anything with a valid database prefix that isn't a document path
@@ -338,7 +349,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<BatchGetDocumentsRequest>,
     ) -> Result<Response<Self::BatchGetDocumentsStream>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let database = DatabaseName::parse(&req.database)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -419,7 +430,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let database = DatabaseName::parse(&req.database)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -473,7 +484,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<Self::RunQueryStream>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let req = request.into_inner();
         let parent = ResourceName::parse(&req.parent)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -602,7 +613,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let stream = crate::write_stream::spawn(
             self.store.clone(),
             self.hub.clone(),
@@ -618,7 +629,7 @@ impl Firestore for FirestoreService {
         &self,
         request: Request<Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>, Status> {
-        let auth = crate::auth::Authorization::from_metadata(request.metadata())?;
+        let auth = self.auth.from_metadata(request.metadata()).await?;
         let stream = crate::listen::spawn(
             self.store.clone(),
             self.hub.clone(),

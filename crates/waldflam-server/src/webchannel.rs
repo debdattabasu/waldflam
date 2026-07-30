@@ -173,7 +173,10 @@ fn unknown_sid() -> Response {
 
 /// Extracts credentials from the handshake body's `headers=` block:
 /// an HTTP/1.1-style CRLF-separated header list, URL-encoded whole.
-fn auth_from_body(body: &[u8]) -> crate::auth::Authorization {
+async fn auth_from_body(
+    policy: &crate::auth::AuthPolicy,
+    body: &[u8],
+) -> crate::auth::Authorization {
     let fields: HashMap<String, String> =
         form_urlencoded::parse(body).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     let Some(block) = fields.get("headers") else {
@@ -183,8 +186,9 @@ fn auth_from_body(body: &[u8]) -> crate::auth::Authorization {
         let (name, value) = line.split_once(':')?;
         name.trim().eq_ignore_ascii_case("authorization").then(|| value.trim().to_owned())
     });
-    crate::auth::Authorization::from_header(header.as_deref())
-        .unwrap_or(crate::auth::Authorization::Unauthenticated)
+    // A token this server won't accept is no better than none: fall back to
+    // anonymous so rules decide, rather than failing the handshake.
+    policy.authorize(header.as_deref()).await.unwrap_or(crate::auth::Authorization::Unauthenticated)
 }
 
 /// Decodes the `count`/`ofs`/`req{i}___data__` form body into raw JSON
@@ -230,7 +234,7 @@ async fn handshake(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Response {
-    let auth = auth_from_body(body);
+    let auth = auth_from_body(&state.svc.auth, body).await;
     let sid = format!(
         "wf{}-{:x}",
         state.sessions.counter.fetch_add(1, Ordering::Relaxed),

@@ -138,9 +138,19 @@ These are the ones to fix before calling waldflam production-ready.
 
 ## Operations & ecosystem
 
-- **Production auth mode.** Today every JWT is decoded but never verified
-  (emulator semantics). A real deployment needs signature verification against
-  Firebase Auth JWKS or a configured issuer, behind a flag.
+- **Admin is a shared secret, not a signed credential.** `WALDFLAM_ADMIN_TOKEN`
+  is a bearer secret: anyone holding it is admin, it doesn't expire, and
+  rotating it means a restart. Firebase uses service-account-signed tokens
+  with real identities. Fix: accept signed service-account tokens, or at
+  least support multiple named secrets that can be rotated one at a time.
+- **No custom claims → rules integration beyond the token payload.** Whatever
+  the issuer puts in the JWT is what rules see. There's no way to attach
+  server-side roles to a uid without the issuer minting them.
+- **Verified mode is untested end to end by the conformance suites.** The
+  verifier has unit tests (signature, expiry, issuer, audience, tampering,
+  unknown key, no `owner` backdoor) and the admin gating was checked by hand,
+  but no harness runs an SDK against a verifying server — that needs a test
+  issuer with a JWKS endpoint.
 - No TLS termination (plaintext h2c only), no rate limiting, no quotas.
 - No metrics/tracing export; logging is minimal.
 - No CI. The conformance matrix should run on every push — it's the main

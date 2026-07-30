@@ -66,11 +66,40 @@ streaming writes, security rules, and Cloud Functions triggers. Seven
 conformance suites in [conformance/](conformance/) prove it against a live
 server on every run.
 
-Still **pre-alpha for production**: JWTs are decoded but not verified
-(emulator semantics), and queries whose filters can't be expressed exactly —
-`!=`, `not-in`, `OR` — still page in the server rather than the database.
-Those and everything else known-missing are catalogued honestly in
-[backlog.md](backlog.md) — read it before deploying anything you care about.
+Still **pre-alpha for production**: admin access in verified mode is a shared
+secret rather than a signed credential, and queries whose filters can't be
+expressed exactly — `!=`, `not-in`, `OR` — still page in the server rather
+than the database. Those and everything else known-missing are catalogued
+honestly in [backlog.md](backlog.md) — read it before deploying anything you
+care about.
+
+## Authentication
+
+By default waldflam runs **emulator semantics**: tokens are decoded but not
+verified and `Bearer owner` is admin. That is what the SDKs' emulator mode
+expects, and it is correct for local development — but it trusts anything it
+is handed, so don't expose it.
+
+For a deployment anyone can reach, turn on verification:
+
+```sh
+WALDFLAM_AUTH=verify
+WALDFLAM_AUTH_ISSUER=https://securetoken.google.com/my-project
+WALDFLAM_AUTH_AUDIENCE=my-project
+WALDFLAM_AUTH_JWKS_URL=https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
+WALDFLAM_ADMIN_TOKEN=<a long random secret>   # optional
+```
+
+Tokens then need a real RS256 signature from a key at that JWKS endpoint,
+plus a matching issuer and audience. The `owner` backdoor does not exist in
+this mode, and the `/emulator/v1` admin endpoints — which load rules and
+erase databases — require the admin token. Leave `WALDFLAM_ADMIN_TOKEN`
+unset and nothing can bypass security rules at all. Any issuer publishing a
+JWK Set works; the values above are Firebase Auth's.
+
+waldflam refuses to start if `verify` is requested without the issuer,
+audience, and JWKS URL — silently falling back to trusting unsigned tokens
+would be worse than not booting.
 
 - [x] **M0 — scaffold**: workspace, full 17-RPC `google.firestore.v1` gRPC
   surface served on h2c, value ordering + resource-name parsing + emulator

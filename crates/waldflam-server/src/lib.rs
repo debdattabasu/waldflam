@@ -18,8 +18,8 @@ use crate::service::FirestoreService;
 /// Serve every protocol surface on one port, like the official emulator:
 /// native gRPC over h2c (all SDKs in emulator mode), REST v1 in proto3-JSON
 /// (JS lite + browser unary), and a health check at `/`.
-pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
-    let svc = Arc::new(FirestoreService::new(store.clone()));
+pub async fn serve(addr: SocketAddr, store: Store, auth: auth::AuthPolicy) -> anyhow::Result<()> {
+    let svc = Arc::new(FirestoreService::with_auth(store.clone(), auth));
     let pool = rest::descriptor_pool();
     let triggers: Arc<functions::TriggerRegistry> = Default::default();
     functions::spawn_dispatcher(svc.hub_handle(), triggers.clone(), pool.clone());

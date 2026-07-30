@@ -15,7 +15,7 @@ async fn serves_firestore_service_over_h2c() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    tokio::spawn(waldflam_server::serve(addr, store));
+    tokio::spawn(waldflam_server::serve(addr, store, Default::default()));
 
     let mut client = loop {
         match FirestoreClient::connect(format!("http://{addr}")).await {
