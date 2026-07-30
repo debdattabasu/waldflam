@@ -10,8 +10,12 @@ npm install
 WALDFLAM_PORT=8080 npm test
 ```
 
-Exercises set/get, increment + serverTimestamp transforms, filtered +
-ordered queries, count aggregation, optimistic transactions, the full
-onSnapshot realtime lifecycle (initial / live add / live delete), and
-deletes. Browser builds (WebChannel transport) and the lite SDK (REST) are
-the remaining M4 surface.
+Three flavors, all unchanged:
+
+- `npm test` / `node main.mjs` — the Node build (gRPC transport)
+- `node lite.mjs` — firebase/firestore/lite (pure fetch() REST)
+- `node --conditions=browser browser.mjs` — the browser build (WebChannel
+  streaming transport for Listen/Write, REST for unary)
+
+Each exercises set/get, transforms, queries, count aggregation, optimistic
+transactions, the full onSnapshot realtime lifecycle, and deletes.

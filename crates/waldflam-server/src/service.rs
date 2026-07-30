@@ -23,6 +23,16 @@ impl FirestoreService {
         Self { store, txns: Default::default(), hub: Default::default() }
     }
 
+    pub fn store_handle(&self) -> Store {
+        self.store.clone()
+    }
+    pub fn hub_handle(&self) -> std::sync::Arc<waldflam_engine::watch::WatchHub> {
+        self.hub.clone()
+    }
+    pub fn txns_handle(&self) -> std::sync::Arc<waldflam_engine::txn::TransactionManager> {
+        self.txns.clone()
+    }
+
     /// Applies one write through the commit machinery (preconditions, watch
     /// fan-out) and returns the resulting document (empty for deletes).
     async fn apply_single_write(

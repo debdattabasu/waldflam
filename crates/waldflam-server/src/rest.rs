@@ -26,6 +26,7 @@ use crate::service::FirestoreService;
 pub struct RestState {
     pub svc: std::sync::Arc<FirestoreService>,
     pub pool: DescriptorPool,
+    pub sessions: std::sync::Arc<crate::webchannel::WebChannelSessions>,
 }
 
 pub fn descriptor_pool() -> DescriptorPool {
@@ -46,7 +47,7 @@ pub async fn v1_post(
             json,
         )
             .into_response(),
-        Err(status) => error_response(&status),
+        Err(status) => status_response(&status),
     }
 }
 
@@ -58,14 +59,14 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
 
     match method {
         "commit" => {
-            let mut req: CommitRequest = from_json(state, "google.firestore.v1.CommitRequest", body)?;
+            let mut req: CommitRequest = json_to_message(state, "google.firestore.v1.CommitRequest", body)?;
             req.database = database_of(resource)?;
             let resp = state.svc.commit(tonic::Request::new(req)).await?;
-            to_json(state, "google.firestore.v1.CommitResponse", &resp.into_inner())
+            message_to_json(state, "google.firestore.v1.CommitResponse", &resp.into_inner())
         }
         "batchGet" => {
             let mut req: BatchGetDocumentsRequest =
-                from_json(state, "google.firestore.v1.BatchGetDocumentsRequest", body)?;
+                json_to_message(state, "google.firestore.v1.BatchGetDocumentsRequest", body)?;
             req.database = database_of(resource)?;
             let stream = state
                 .svc
@@ -76,14 +77,14 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
         }
         "runQuery" => {
             let mut req: RunQueryRequest =
-                from_json(state, "google.firestore.v1.RunQueryRequest", body)?;
+                json_to_message(state, "google.firestore.v1.RunQueryRequest", body)?;
             req.parent = resource.to_owned();
             let stream = state.svc.run_query(tonic::Request::new(req)).await?.into_inner();
             collect_json(state, "google.firestore.v1.RunQueryResponse", stream).await
         }
         "runAggregationQuery" => {
             let mut req: RunAggregationQueryRequest =
-                from_json(state, "google.firestore.v1.RunAggregationQueryRequest", body)?;
+                json_to_message(state, "google.firestore.v1.RunAggregationQueryRequest", body)?;
             req.parent = resource.to_owned();
             let stream = state
                 .svc
@@ -94,14 +95,14 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
         }
         "beginTransaction" => {
             let mut req: BeginTransactionRequest =
-                from_json(state, "google.firestore.v1.BeginTransactionRequest", body)?;
+                json_to_message(state, "google.firestore.v1.BeginTransactionRequest", body)?;
             req.database = database_of(resource)?;
             let resp = state.svc.begin_transaction(tonic::Request::new(req)).await?;
-            to_json(state, "google.firestore.v1.BeginTransactionResponse", &resp.into_inner())
+            message_to_json(state, "google.firestore.v1.BeginTransactionResponse", &resp.into_inner())
         }
         "rollback" => {
             let mut req: RollbackRequest =
-                from_json(state, "google.firestore.v1.RollbackRequest", body)?;
+                json_to_message(state, "google.firestore.v1.RollbackRequest", body)?;
             req.database = database_of(resource)?;
             state.svc.rollback(tonic::Request::new(req)).await?;
             Ok("{}".into())
@@ -118,7 +119,7 @@ fn database_of(resource: &str) -> Result<String, Status> {
         .ok_or_else(|| Status::invalid_argument("expected {database}/documents resource"))
 }
 
-fn from_json<T: Message + Default>(
+pub(crate) fn json_to_message<T: Message + Default>(
     state: &RestState,
     message_name: &str,
     body: &[u8],
@@ -138,7 +139,7 @@ fn from_json<T: Message + Default>(
         .map_err(|e| Status::internal(format!("transcode: {e}")))
 }
 
-fn to_json<T: Message>(
+pub(crate) fn message_to_json<T: Message>(
     state: &RestState,
     message_name: &str,
     message: &T,
@@ -164,7 +165,7 @@ where
 {
     let mut parts = Vec::new();
     while let Some(item) = stream.next().await {
-        parts.push(to_json(state, message_name, &item?)?);
+        parts.push(message_to_json(state, message_name, &item?)?);
     }
     Ok(format!("[{}]", parts.join(",")))
 }
@@ -173,7 +174,7 @@ pub async fn health() -> &'static str {
     "Ok\n"
 }
 
-fn error_response(status: &Status) -> Response {
+pub(crate) fn status_response(status: &Status) -> Response {
     let (http, name) = http_code(status.code());
     let body = serde_json::json!({
         "error": {
@@ -240,6 +241,10 @@ pub async fn cors(
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
             HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("X-HTTP-Session-Id"),
         );
         if let Some(requested) = requested {
             headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested);
