@@ -382,6 +382,79 @@ fn filter_type(filter: Filter) -> FilterType {
     filter.filter_type.expect("constructed with a filter type")
 }
 
+/// The plan MongoDB actually ran. `rejectedPlans` holds the alternatives it
+/// considered — asserting against the whole explain document would match
+/// stages that never executed.
+fn winning_plan(explain: &mongodb::bson::Document) -> String {
+    explain
+        .get_document("queryPlanner")
+        .and_then(|planner| planner.get_document("winningPlan"))
+        .expect("queryPlanner.winningPlan")
+        .to_string()
+}
+
+/// The point of storing sort keys as real fields: MongoDB must answer
+/// `ORDER BY <field>, __name__ LIMIT n` from the index and stop at n, instead
+/// of ranking every candidate. A blocking `SORT` stage here means the
+/// wildcard index stopped covering the order — which still returns correct
+/// results, so only the plan reveals it.
+#[tokio::test]
+async fn sorted_pages_avoid_a_blocking_sort() {
+    let store = store().await;
+    let db = test_db("nosort");
+    seed(&store, &db, "items").await;
+    let root = ResourcePath::parse("").unwrap();
+
+    // Run it for real first, both to create the indexes and to fix the
+    // expected page.
+    let query = StructuredQuery {
+        from: vec![CollectionSelector { collection_id: "items".into(), all_descendants: false }],
+        order_by: vec![order("n", true)],
+        limit: Some(5),
+        ..Default::default()
+    };
+    let page = run_query(&store, &db, &root, &query).await.unwrap();
+    assert_eq!(page.len(), 5);
+
+    // Now ask MongoDB how it ran it.
+    let predicate = waldflam_engine::plan::plan(&[], &["n", "__name__"])
+        .predicate
+        .expect("ordering by a plain field requires it to exist");
+    let mut filter = doc! { "collection_path": "items" };
+    for (key, value) in predicate {
+        filter.insert(key, value);
+    }
+    let sort = doc! {
+        waldflam_engine::plan::sort_field("n"): 1,
+        waldflam_engine::plan::sort_field("__name__"): 1,
+    };
+
+    let client = mongodb::Client::with_uri_str(&uri()).await.unwrap();
+    let explain = client
+        .database("waldflam")
+        .run_command(doc! {
+            "explain": {
+                "find": format!("{}~{}", db.project_id, db.database_id),
+                "filter": filter,
+                "sort": sort,
+                "limit": 5,
+            },
+            "verbosity": "executionStats",
+        })
+        .await
+        .expect("explain");
+
+    // Only the winning plan matters: `rejectedPlans` legitimately contains
+    // the blocking-sort alternatives the planner considered and discarded.
+    let winning = winning_plan(&explain);
+    assert!(!winning.contains("SORT"), "ordering fell back to a blocking sort:\n{winning}");
+    let examined = explain
+        .get_document("executionStats")
+        .and_then(|stats| stats.get_i32("totalDocsExamined").map(i64::from))
+        .expect("executionStats.totalDocsExamined");
+    assert!(examined <= 5, "index-ordered page examined {examined} documents for a limit of 5");
+}
+
 /// Being correct is not the point on its own — the predicate has to be served
 /// by an index, otherwise this is a scan with extra steps.
 #[tokio::test]
@@ -420,9 +493,9 @@ async fn filters_are_served_by_an_index_scan() {
         .await
         .expect("explain");
 
-    let rendered = explain.to_string();
-    assert!(rendered.contains("IXSCAN"), "predicate fell back to a collection scan:\n{rendered}");
-    assert!(!rendered.contains("COLLSCAN"), "plan still contains a COLLSCAN:\n{rendered}");
+    let winning = winning_plan(&explain);
+    assert!(winning.contains("IXSCAN"), "predicate fell back to a collection scan:\n{winning}");
+    assert!(!winning.contains("COLLSCAN"), "winning plan is a COLLSCAN:\n{winning}");
 
     let examined = explain
         .get_document("executionStats")

@@ -173,7 +173,7 @@ fn pushdown_window(
             .iter()
             .map(|order| {
                 let ascending = order.direction != Direction::Descending as i32;
-                (order_path(order).to_owned(), ascending)
+                (crate::plan::sort_field(order_path(order)), ascending)
             })
             .collect(),
         skip: i64::from(query.offset.max(0)),

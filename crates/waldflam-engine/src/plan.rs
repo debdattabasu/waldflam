@@ -19,13 +19,12 @@
 //! order-preserving across the whole cross-type ordering, so equality is byte
 //! equality and Firestore's ranges are sub-ranges of Mongo's.
 //!
-//! **Only one clause is selective.** MongoDB applies one `$elemMatch` per
-//! index scan, so with several filters it seeks on one and applies the rest
+//! **Only one clause is selective.** A wildcard index scan binds one field
+//! path, so with several filters MongoDB seeks on one and applies the rest
 //! while fetching. Emitting all of them is still worth it — the planner
-//! picks, and the others narrow nothing but cost nothing — but no arrangement
-//! of clauses here makes a second filter selective. That needs a composite
-//! index keyed per query shape, which the single `indexed` array cannot
-//! express; see architecture.md §9 and backlog.md.
+//! picks, and the others cost nothing — but no arrangement of clauses here
+//! makes a second filter selective. That needs a composite index keyed per
+//! query shape; see architecture.md §9 and backlog.md.
 
 use mongodb::bson::{Bson, Document, doc};
 use waldflam_proto::v1::Value;
@@ -100,7 +99,7 @@ fn clause_for(filter: &FilterType) -> Option<(Document, bool)> {
                 // encode a value that means something else in index space.
                 FieldOp::Equal => {
                     reject_null_nan(operand)?;
-                    Some((entry(&path, "v", key(operand).into()), true))
+                    Some((value_clause(&path, key(operand).into()), true))
                 }
                 // Type-bounded on both sides, so exact — see `range`.
                 FieldOp::LessThan => range(&path, operand, "$lt"),
@@ -110,13 +109,13 @@ fn clause_for(filter: &FilterType) -> Option<(Document, bool)> {
                 // Array membership rides the per-element "e" entries.
                 FieldOp::ArrayContains => {
                     reject_null_nan(operand)?;
-                    Some((entry(&path, "e", key(operand).into()), true))
+                    Some((element_clause(&path, key(operand).into()), true))
                 }
                 FieldOp::ArrayContainsAny => {
-                    Some((entry(&path, "e", doc! { "$in": key_set(operand)? }.into()), true))
+                    Some((element_clause(&path, doc! { "$in": key_set(operand)? }.into()), true))
                 }
                 FieldOp::In => {
-                    Some((entry(&path, "v", doc! { "$in": key_set(operand)? }.into()), true))
+                    Some((value_clause(&path, doc! { "$in": key_set(operand)? }.into()), true))
                 }
                 // Negations: the most we can say cheaply is that the field
                 // has to exist at all, which Firestore also requires. The
@@ -132,8 +131,8 @@ fn clause_for(filter: &FilterType) -> Option<(Document, bool)> {
             };
             let path = plain_path(&field.field_path)?;
             match u.op() {
-                UnaryOp::IsNull => Some((entry(&path, "v", key(&null_value()).into()), true)),
-                UnaryOp::IsNan => Some((entry(&path, "v", key(&nan_value()).into()), true)),
+                UnaryOp::IsNull => Some((value_clause(&path, key(&null_value()).into()), true)),
+                UnaryOp::IsNan => Some((value_clause(&path, key(&nan_value()).into()), true)),
                 // "not null" / "not NaN" still require the field to exist,
                 // which is all we can say — a superset.
                 UnaryOp::IsNotNull | UnaryOp::IsNotNan => Some((exists(&path), false)),
@@ -169,18 +168,40 @@ fn range(path: &str, operand: &Value, op: &str) -> Option<(Document, bool)> {
         let next = u8::from_str_radix(&tag, 16).ok()? + 1;
         cond.insert("$lt", format!("{next:02x}"));
     }
-    Some((entry(path, "v", cond.into()), true))
+    Some((value_clause(path, cond.into()), true))
 }
 
-/// Matches documents having an index entry for `path` of kind `kind` whose
-/// key satisfies `value`.
-fn entry(path: &str, kind: &str, value: Bson) -> Document {
-    doc! { "indexed": { "$elemMatch": { "p": path, "k": kind, "v": value } } }
+/// The stored column holding `path`'s encoded key. `__name__` lives
+/// top-level so it can be the trailing column of the wildcard indexes;
+/// everything else is a leaf of the nested `keys` mirror.
+pub fn sort_field(path: &str) -> String {
+    if path == "__name__" {
+        "name_key".to_owned()
+    } else {
+        format!("keys.{path}.{}", crate::store::VALUE_KEY)
+    }
+}
+
+/// Matches documents whose value at `path` satisfies `value`.
+fn value_clause(path: &str, value: Bson) -> Document {
+    doc! { sort_field(path): value }
+}
+
+/// Matches documents one of whose array elements at `path` satisfies
+/// `value`. Array membership keeps its own entries, since a sort column can
+/// only hold one key per document.
+fn element_clause(path: &str, value: Bson) -> Document {
+    doc! { "elements": { "$elemMatch": { "p": path, "v": value } } }
 }
 
 /// Matches documents where `path` is present at all.
+///
+/// Doubles as the range bound a wildcard index needs before it will serve a
+/// sort on that path — every stored key is a non-empty string, so `$gte: ""`
+/// is exactly "this field exists", which is also what Firestore requires of
+/// an order-by field. One clause, both jobs.
 fn exists(path: &str) -> Document {
-    doc! { "indexed": { "$elemMatch": { "p": path, "k": "v" } } }
+    value_clause(path, doc! { "$gte": "" }.into())
 }
 
 fn key(value: &Value) -> String {

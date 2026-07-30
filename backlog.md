@@ -53,28 +53,28 @@ These are the ones to fix before calling waldflam production-ready.
   wider than the query, so `limit` has to stay in memory or it would count
   documents the exact pass is about to reject. Those queries still read all
   candidates.
-- **The pushed-down sort is not index-backed.** It sorts on keys lifted out
-  of the `indexed` array with `$addFields`, which no index covers, so MongoDB
-  does a top-K sort. Far better than shipping every candidate to the server —
-  but a stored per-order-by key column would let an index provide the order
-  directly.
+- **Index-ordered pages need a bound on the sort field.** The wildcard index
+  serves the order only because the predicate always carries the order-by
+  field's existence clause (`$gte: ""`). If that clause is ever dropped as an
+  optimization, ordering silently reverts to a blocking sort — correct
+  results, much more work. `sorted_pages_avoid_a_blocking_sort` guards it.
 - **Some filters can't be planned and still scan.** `!=` and `not-in` narrow
   only to "field exists"; `OR` isn't supported at all; backtick-escaped field
   paths are skipped deliberately, since a dotted path is ambiguous between a
   nested map and a field whose name contains a dot. Each of these falls back
   to a collection scan plus in-memory filtering, which is correct but slow.
-- **Multi-filter queries only get single-field selectivity — there are no
-  composite indexes.** All index entries live in one array per document, and
-  MongoDB derives bounds from a single `$elemMatch` per index scan. A query
-  with two filters therefore seeks on one of them and filters the rest during
-  FETCH. Measured on `even == true AND n > 30` over 40 documents: 20 keys
-  examined, 20 documents fetched, 16 returned — the `n > 30` clause
-  contributed nothing.
+- **Multi-filter queries only get single-field selectivity, and deep sorts
+  fall back to a blocking sort — there are no composite indexes.** A wildcard
+  index scan binds one field path, so a query with two filters seeks on one
+  and applies the rest during FETCH. Likewise, a normalized order-by of three
+  or more columns (an explicit multi-field sort, or an inequality on a field
+  other than the sort field, which `normalize_orders` appends) exceeds the
+  one-wildcard-plus-`name_key` shape and gets top-K sorted instead.
 
   This is the design's ceiling, not a bug to patch. A composite index needs
   one key per *query shape*, holding the fields' encodings concatenated in
-  order; the single attribute-pattern array structurally cannot provide that.
-  Firestore resolves it by making composite indexes user-declared
+  order; a per-field index structurally cannot provide that. Firestore
+  resolves it by making composite indexes user-declared
   (`firestore.indexes.json`) while single-field indexing stays automatic —
   and waldflam already has the automatic half.
 

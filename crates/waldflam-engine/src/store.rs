@@ -9,11 +9,17 @@
 //! - `create_time_us` / `update_time_us`: microsecond timestamps —
 //!   `update_time_us` is also the document version for preconditions
 //! - `payload`: the full field map as a prost-encoded `Document` (lossless)
-//! - `indexed`: derived index entries in the attribute pattern —
-//!   `{p: <dotted field path>, k: "v"|"e", v: <hex index key>}`. Kind `"v"`
-//!   is the field's whole value (equality/range/order-by); `"e"` is one
-//!   entry per array element (`array-contains`). `__name__` is always
-//!   present, so every document has at least one entry.
+//! - `keys`: a nested mirror of the document's fields, each node holding its
+//!   own order-preserving index key under `__val__` — so `keys.meta.__val__`
+//!   is the map's key and `keys.meta.group.__val__` its child's. Real fields
+//!   rather than an array, because MongoDB can sort from an index only on a
+//!   stored path; a wildcard index over `keys` keeps that automatic for
+//!   schemaless documents.
+//! - `name_key`: the `__name__` key, top-level so it can be the trailing
+//!   column of those indexes and serve Firestore's implicit `__name__`
+//!   tiebreak without a blocking sort.
+//! - `elements`: `{p, v}` per array element, for `array-contains` — a sort
+//!   column holds one key per document, so membership needs its own entries.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,9 +55,14 @@ struct DocRow {
 #[derive(Debug, Serialize)]
 struct IndexEntry {
     p: String,
-    k: &'static str,
     v: String,
 }
+
+/// Holds a node's own encoded key inside the `keys` mirror. Inside
+/// Firestore's reserved `__.*__` field-name pattern, so it cannot collide
+/// with a user field — and it keeps every queried leaf a string, which is
+/// what makes the `$gte: ""` existence bound well-defined.
+pub const VALUE_KEY: &str = "__val__";
 
 /// A document as read back from storage.
 #[derive(Debug, Clone)]
@@ -91,8 +102,9 @@ pub struct CommitNotice {
 /// non-matches. See `plan::Plan::exact`.
 #[derive(Debug, Clone)]
 pub struct SortWindow {
-    /// Normalized order-by, as (field path, ascending). Always ends with
-    /// `__name__`, so the order is total.
+    /// Normalized order-by as (stored key column, ascending) — BSON paths
+    /// from `plan::sort_field`, not Firestore field paths. Always ends with
+    /// `name_key`, so the order is total.
     pub order_by: Vec<(String, bool)>,
     pub skip: i64,
     pub limit: Option<i64>,
@@ -274,7 +286,7 @@ impl Store {
     ) -> Result<StoredDocument, EngineError> {
         assert!(path.is_document(), "not a document path: {path}");
         let payload = Document { fields: fields.clone(), ..Default::default() }.encode_to_vec();
-        let indexed = index_entries(database, path, &fields);
+        let index = index_document(database, path, &fields);
         let collection_path = path.parent().expect("document has a parent");
 
         let update = doc! {
@@ -283,7 +295,9 @@ impl Store {
                 "collection_id": collection_path.last_id().unwrap_or_default(),
                 "update_time_us": now_us,
                 "payload": Binary { subtype: BinarySubtype::Generic, bytes: payload },
-                "indexed": to_bson(&indexed).map_err(|e| {
+                "keys": index.keys,
+                "name_key": index.name_key,
+                "elements": to_bson(&index.elements).map_err(|e| {
                     EngineError::InvalidArgument(format!("index entries: {e}"))
                 })?,
             },
@@ -349,52 +363,33 @@ impl Store {
 
     /// Runs `filter`, optionally ordering and truncating server-side.
     ///
-    /// Without a window this is a plain `find`. With one it becomes an
-    /// aggregation that lifts each order-by field's index key out of the
-    /// `indexed` array and sorts on it — the keys are order-preserving, so
-    /// sorting by key is sorting by value — then applies `$skip`/`$limit` so
-    /// only the requested page crosses the wire.
+    /// The sort columns are stored index keys, which are order-preserving, so
+    /// sorting by key is sorting by value. Keeping them as real fields rather
+    /// than computed ones is the whole point: MongoDB can then answer the
+    /// sort from the index and stop at `limit`, instead of ranking every
+    /// candidate.
     async fn fetch(
         &self,
         database: &DatabaseName,
         filter: BsonDocument,
         window: Option<SortWindow>,
     ) -> Result<Vec<StoredDocument>, EngineError> {
-        let Some(window) = window else {
-            return self.collect_rows(self.collection(database).find(filter).await?).await;
-        };
-
-        let mut extract = BsonDocument::new();
-        let mut sort = BsonDocument::new();
-        let mut temporaries = Vec::new();
-        for (i, (path, ascending)) in window.order_by.iter().enumerate() {
-            let alias = format!("__sort{i}");
-            extract.insert(
-                &alias,
-                doc! { "$first": { "$filter": {
-                    "input": "$indexed",
-                    "cond": { "$and": [
-                        { "$eq": ["$$this.p", path] },
-                        { "$eq": ["$$this.k", "v"] },
-                    ] },
-                } } },
-            );
-            sort.insert(format!("{alias}.v"), if *ascending { 1 } else { -1 });
-            temporaries.push(alias);
+        let collection = self.collection(database);
+        let mut find = collection.find(filter);
+        if let Some(window) = window {
+            let mut sort = BsonDocument::new();
+            for (field, ascending) in &window.order_by {
+                sort.insert(field, if *ascending { 1 } else { -1 });
+            }
+            find = find.sort(sort);
+            if window.skip > 0 {
+                find = find.skip(window.skip as u64);
+            }
+            if let Some(limit) = window.limit {
+                find = find.limit(limit);
+            }
         }
-
-        let mut stages = vec![doc! { "$match": filter }, doc! { "$addFields": extract }];
-        stages.push(doc! { "$sort": sort });
-        if window.skip > 0 {
-            stages.push(doc! { "$skip": window.skip });
-        }
-        if let Some(limit) = window.limit {
-            stages.push(doc! { "$limit": limit });
-        }
-        stages.push(doc! { "$unset": temporaries });
-
-        let cursor = self.collection(database).aggregate(stages).with_type::<DocRow>().await?;
-        self.collect_rows(cursor).await
+        self.collect_rows(find.await?).await
     }
 
     /// Folds an index predicate into a base filter, ensuring the indexes that
@@ -414,11 +409,17 @@ impl Store {
         Ok(base)
     }
 
-    /// Creates the compound multikey indexes the planner's predicates ride
-    /// on, once per database per process. Both keys live inside the same
-    /// `indexed` array, which MongoDB allows (the parallel-array restriction
-    /// is about two *different* arrays), so an `$elemMatch` on `p` and `v`
-    /// can be served by one index scan.
+    /// Creates the indexes the planner's predicates ride on, once per
+    /// database per process. Nothing here is user-declared: a *wildcard*
+    /// component covers every field path any document happens to have, which
+    /// is what keeps indexing automatic for schemaless documents.
+    ///
+    /// The shape matters. A wildcard component can serve a sort only when the
+    /// query also bounds that field path, and only for one wildcard field —
+    /// but a trailing *regular* column is allowed, and `name_key` is exactly
+    /// the implicit `__name__` tiebreak Firestore appends to every order-by.
+    /// So `{scope, keys.$**, name_key}` covers `ORDER BY <any field>, __name__`
+    /// without a blocking sort.
     async fn ensure_query_indexes(&self, database: &DatabaseName) -> Result<(), EngineError> {
         let name = format!("{}~{}", database.project_id, database.database_id);
         {
@@ -428,8 +429,11 @@ impl Store {
             }
         }
         let models = [
-            doc! { "collection_path": 1, "indexed.p": 1, "indexed.v": 1 },
-            doc! { "collection_id": 1, "indexed.p": 1, "indexed.v": 1 },
+            doc! { "collection_path": 1, "keys.$**": 1, "name_key": 1 },
+            doc! { "collection_id": 1, "keys.$**": 1, "name_key": 1 },
+            // `array-contains` matches per-element entries instead.
+            doc! { "collection_path": 1, "elements.p": 1, "elements.v": 1 },
+            doc! { "collection_id": 1, "elements.p": 1, "elements.v": 1 },
         ]
         .map(|keys| mongodb::IndexModel::builder().keys(keys).build());
         // Idempotent: a concurrent caller creating the same indexes is fine.
@@ -524,11 +528,24 @@ fn decode_row(row: DocRow) -> Result<StoredDocument, EngineError> {
     })
 }
 
-fn index_entries(
+/// The derived index columns for one document.
+struct DocumentIndex {
+    /// Nested mirror of the document's field structure, each node carrying
+    /// its own encoded key under `VALUE_KEY`.
+    keys: BsonDocument,
+    /// One entry per array element, for `array-contains`.
+    elements: Vec<IndexEntry>,
+    /// The document's `__name__` key, kept top-level so it can be the
+    /// trailing column of the wildcard indexes and serve the implicit
+    /// `__name__` tiebreak.
+    name_key: String,
+}
+
+fn index_document(
     database: &DatabaseName,
     path: &ResourcePath,
     fields: &HashMap<String, Value>,
-) -> Vec<IndexEntry> {
+) -> DocumentIndex {
     let name = Value {
         value_type: Some(ValueType::ReferenceValue(format!(
             "{}/{}",
@@ -536,33 +553,38 @@ fn index_entries(
             path
         ))),
     };
-    let mut out =
-        vec![IndexEntry { p: "__name__".into(), k: "v", v: to_index_string(&encode_value(&name)) }];
+    let mut elements = Vec::new();
+    let mut keys = BsonDocument::new();
     for (field, value) in fields {
-        // TODO(field-paths): escape components needing backticks; plain
-        // dotted join for now.
-        add_entries(&mut out, field.clone(), value);
+        // TODO(field-paths): escape components needing backticks; a field
+        // literally named `a.b` still collides with the map path `a` → `b`.
+        keys.insert(field, key_node(value, field, &mut elements));
     }
-    out
+    DocumentIndex { keys, elements, name_key: to_index_string(&encode_value(&name)) }
 }
 
-fn add_entries(out: &mut Vec<IndexEntry>, path: String, value: &Value) {
-    out.push(IndexEntry { p: path.clone(), k: "v", v: to_index_string(&encode_value(value)) });
+/// One node of the `keys` mirror: its own key under `VALUE_KEY`, plus a child
+/// node per map entry. The sentinel is what lets a map hold both its own
+/// encoded value and its children — `keys.meta` cannot be a string and a
+/// subdocument at once.
+fn key_node(value: &Value, path: &str, elements: &mut Vec<IndexEntry>) -> BsonDocument {
+    let mut node = BsonDocument::new();
+    node.insert(VALUE_KEY, to_index_string(&encode_value(value)));
     match value.value_type.as_ref() {
-        Some(ValueType::ArrayValue(a)) => {
-            for element in &a.values {
-                out.push(IndexEntry {
-                    p: path.clone(),
-                    k: "e",
+        Some(ValueType::ArrayValue(array)) => {
+            for element in &array.values {
+                elements.push(IndexEntry {
+                    p: path.to_owned(),
                     v: to_index_string(&encode_value(element)),
                 });
             }
         }
-        Some(ValueType::MapValue(m)) => {
-            for (k, v) in &m.fields {
-                add_entries(out, format!("{path}.{k}"), v);
+        Some(ValueType::MapValue(map)) => {
+            for (name, child) in &map.fields {
+                node.insert(name, key_node(child, &format!("{path}.{name}"), elements));
             }
         }
         _ => {}
     }
+    node
 }

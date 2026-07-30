@@ -422,23 +422,37 @@ and one by measuring query plans:
 3. **Mongo compares BSON `BinData` by length first**, so variable-length
    memcomparable keys cannot be stored as binary; index keys are lowercase-hex
    strings, which compare bytewise.
-4. **The attribute pattern indexes one field per scan, not several.** §6
-   planned `$indexedFields` as a per-field object; as built, index entries are
-   one array of `{p, k, v}` triples per document (`store.rs`), which is what
-   makes indexing automatic and sparse — a field that isn't present has no
-   entry, and no schema has to be known in advance.
+4. **Sort keys have to be stored fields, and the tiebreak has to be a
+   regular column.** §6 planned `$indexedFields` as a per-field object; the
+   first build used one array of `{p, k, v}` triples, which indexes and
+   filters well but can never order — MongoDB sorts from an index only on a
+   stored path, and a value inside an array isn't one. Extracting it per
+   query with `$addFields` produced correct pages via a blocking top-K sort,
+   never an index-ordered one.
 
-   The cost shows up in the query plan. MongoDB derives index bounds on
-   several keys of the *same* array only when the query uses `$elemMatch`
-   (without it the value column degrades to `[MinKey, MaxKey]`), and it
-   applies one `$elemMatch` per index scan. So the compound index
-   `{collection_path, indexed.p, indexed.v}` gives an exact seek for a single
-   filter, while a second filter contributes nothing to selectivity and is
-   applied during FETCH. True composite indexes would need one key per query
-   shape holding the fields' encodings concatenated — which this structure
-   cannot express, and which is precisely why Firestore has users declare
-   composite indexes while single-field indexing stays automatic. Tracked in
-   [backlog.md](backlog.md).
+   As built (`store.rs`): a nested `keys` mirror of the document's fields,
+   each node holding its own key under the reserved `__val__` sentinel — a
+   map needs to carry both its own value and its children, and
+   `keys.meta` cannot be a string and a subdocument at once. A **wildcard**
+   index over `keys` keeps this automatic for schemaless documents, with two
+   measured constraints shaping the rest:
+
+   - A wildcard component serves a sort only if the query also *bounds* that
+     path. `$exists: true` does not qualify; a range does. Firestore already
+     requires order-by fields to exist, so the existence clause and the bound
+     are the same clause.
+   - It serves a sort on only one wildcard field — but a trailing *regular*
+     column is allowed. `__name__` is Firestore's implicit tiebreak on every
+     order-by, so storing it as top-level `name_key` makes
+     `{scope, keys.$**, name_key}` cover `ORDER BY <any field>, __name__`
+     without a blocking sort.
+
+   The remaining ceiling is unchanged: one field path binds per index scan,
+   so a second filter contributes no selectivity, and a query whose
+   normalized order-by has three or more columns falls back to a top-K sort.
+   True composite indexes need one key per query shape — precisely why
+   Firestore has users declare them while single-field indexing stays
+   automatic. Tracked in [backlog.md](backlog.md).
 
 ## 10. Questions research resolved
 
