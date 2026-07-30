@@ -218,7 +218,7 @@ The credentials suite needs a server that actually verifies signatures, so it
 gets its own:
 
 ```sh
-waldflam credentials create ci --project cred-ci --out key.json
+waldflam credentials create ci-runner --project cred-ci --out key.json
 WALDFLAM_AUTH=verify WALDFLAM_LISTEN=127.0.0.1:8099 \
   WALDFLAM_PUBLIC_URL=http://127.0.0.1:8099 waldflam &
 cd conformance/js && WALDFLAM_PORT=8099 WALDFLAM_KEY_FILE=../../key.json \

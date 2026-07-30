@@ -125,7 +125,7 @@ jobs:
       # verified mode, on its own port, plus a service account to present.
       - name: Start waldflam in verified mode
         run: |
-          ./target/debug/waldflam credentials create ci --project cred-ci --out key.json
+          ./target/debug/waldflam credentials create ci-runner --project cred-ci --out key.json
           nohup ./target/debug/waldflam > verify.log 2>&1 &
           for _ in $(seq 1 60); do
             (echo > /dev/tcp/127.0.0.1/8099) >/dev/null 2>&1 && exit 0
