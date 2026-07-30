@@ -15,11 +15,12 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 pub struct FirestoreService {
     store: Store,
     txns: std::sync::Arc<waldflam_engine::txn::TransactionManager>,
+    hub: std::sync::Arc<waldflam_engine::watch::WatchHub>,
 }
 
 impl FirestoreService {
     pub fn new(store: Store) -> Self {
-        Self { store, txns: Default::default() }
+        Self { store, txns: Default::default(), hub: Default::default() }
     }
 
     fn begin_txn(&self, database: &DatabaseName, options: Option<&TransactionOptions>) -> Vec<u8> {
@@ -32,21 +33,21 @@ impl FirestoreService {
     }
 }
 
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock before epoch")
         .as_micros() as i64
 }
 
-fn timestamp_from_us(us: i64) -> prost_types::Timestamp {
+pub(crate) fn timestamp_from_us(us: i64) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: us.div_euclid(1_000_000),
         nanos: (us.rem_euclid(1_000_000) * 1_000) as i32,
     }
 }
 
-fn to_wire_document(name: &ResourceName, doc: StoredDocument) -> Document {
+pub(crate) fn to_wire_document(name: &ResourceName, doc: StoredDocument) -> Document {
     Document {
         name: name.to_string(),
         fields: doc.fields,
@@ -301,12 +302,18 @@ impl Firestore for FirestoreService {
                 .await
                 .map_err(engine_status)?;
         }
-        let outcomes =
+        let applied =
             waldflam_engine::commit::apply_commit(&self.store, &database, &req.writes, now)
                 .await
                 .map_err(engine_status)?;
+        self.hub.publish(waldflam_engine::watch::CommitEvent {
+            database,
+            changes: applied.changes,
+            commit_us: now,
+        });
         Ok(Response::new(CommitResponse {
-            write_results: outcomes
+            write_results: applied
+                .outcomes
                 .into_iter()
                 .map(|o| WriteResult {
                     update_time: Some(timestamp_from_us(o.update_time_us)),
@@ -414,16 +421,94 @@ impl Firestore for FirestoreService {
 
     async fn write(
         &self,
-        _request: Request<Streaming<WriteRequest>>,
+        request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>, Status> {
-        Err(Status::unimplemented("Write"))
+        let mut requests = request.into_inner();
+        let store = self.store.clone();
+        let hub = self.hub.clone();
+        let txns = self.txns.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<WriteResponse, Status>>(64);
+        tokio::spawn(async move {
+            // Contract: every response carries a non-empty stream_token; the
+            // handshake (and any empty-writes request) gets a token-only
+            // response with no write_results; stream_id is never required.
+            let mut token: u64 = 0;
+            let mut database: Option<DatabaseName> = None;
+            while let Ok(Some(req)) = requests.message().await {
+                if database.is_none() {
+                    match DatabaseName::parse(&req.database) {
+                        Ok(db) => database = Some(db),
+                        Err(e) => {
+                            let _ = tx.send(Err(Status::invalid_argument(e.to_string()))).await;
+                            return;
+                        }
+                    }
+                }
+                let db = database.clone().expect("just set");
+                token += 1;
+                let stream_token = token.to_be_bytes().to_vec();
+
+                if req.writes.is_empty() {
+                    let ok = tx
+                        .send(Ok(WriteResponse { stream_token, ..Default::default() }))
+                        .await;
+                    if ok.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+
+                let now = now_us();
+                let guard = txns.commit_lock.lock().await;
+                let applied =
+                    waldflam_engine::commit::apply_commit(&store, &db, &req.writes, now).await;
+                drop(guard);
+                match applied {
+                    Ok(applied) => {
+                        hub.publish(waldflam_engine::watch::CommitEvent {
+                            database: db,
+                            changes: applied.changes,
+                            commit_us: now,
+                        });
+                        let response = WriteResponse {
+                            stream_token,
+                            write_results: applied
+                                .outcomes
+                                .into_iter()
+                                .map(|o| WriteResult {
+                                    update_time: Some(timestamp_from_us(o.update_time_us)),
+                                    transform_results: o.transform_results,
+                                })
+                                .collect(),
+                            commit_time: Some(timestamp_from_us(now)),
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(engine_status(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn listen(
         &self,
-        _request: Request<Streaming<ListenRequest>>,
+        request: Request<Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>, Status> {
-        Err(Status::unimplemented("Listen"))
+        let stream = crate::listen::spawn(
+            self.store.clone(),
+            self.hub.clone(),
+            request.into_inner(),
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn list_collection_ids(

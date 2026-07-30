@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
@@ -12,7 +13,8 @@ import (
 
 func main() {
 	ctx := context.Background()
-	client, err := firestore.NewClient(ctx, "go-conf")
+	projectID := fmt.Sprintf("go-conf-%d", time.Now().UnixNano())
+	client, err := firestore.NewClient(ctx, projectID)
 	if err != nil {
 		log.Fatalf("NewClient: %v", err)
 	}
@@ -94,6 +96,7 @@ func main() {
 	fmt.Println("DELETE ok")
 
 	runTransactionChecks(ctx, client)
+	runListenChecks(ctx, client)
 
 	fmt.Println("ALL GO CLIENT CHECKS PASSED")
 	os.Exit(0)

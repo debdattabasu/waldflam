@@ -15,5 +15,6 @@ pub mod path;
 pub mod query;
 pub mod store;
 pub mod txn;
+pub mod watch;
 
 pub use error::EngineError;

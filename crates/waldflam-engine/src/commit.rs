@@ -32,6 +32,14 @@ pub struct WriteOutcome {
     pub transform_results: Vec<Value>,
 }
 
+/// A commit's results plus the final state of every changed document
+/// (`None` = deleted), for watch fan-out.
+#[derive(Debug)]
+pub struct CommitApplied {
+    pub outcomes: Vec<WriteOutcome>,
+    pub changes: Vec<(ResourcePath, Option<crate::store::StoredDocument>)>,
+}
+
 #[derive(Debug, Clone)]
 struct DocState {
     /// (create_time_us, update_time_us, fields) when the doc exists.
@@ -46,7 +54,7 @@ pub async fn apply_commit(
     database: &DatabaseName,
     writes: &[Write],
     now_us: i64,
-) -> Result<Vec<WriteOutcome>, EngineError> {
+) -> Result<CommitApplied, EngineError> {
     // Load each distinct target once.
     let mut states: HashMap<String, DocState> = HashMap::new();
     for write in writes {
@@ -70,6 +78,7 @@ pub async fn apply_commit(
     }
 
     // Persist final states.
+    let mut changes = Vec::new();
     for write in writes {
         let path = write_target(database, write)?;
         let key = path.to_string();
@@ -80,14 +89,16 @@ pub async fn apply_commit(
         state.dirty = false;
         match &state.current {
             Some((_, _, fields)) => {
-                store.set_document(database, &path, fields.clone(), now_us).await?;
+                let stored = store.set_document(database, &path, fields.clone(), now_us).await?;
+                changes.push((path, Some(stored)));
             }
             None => {
                 store.delete_document(database, &path).await?;
+                changes.push((path, None));
             }
         }
     }
-    Ok(outcomes)
+    Ok(CommitApplied { outcomes, changes })
 }
 
 fn write_target(database: &DatabaseName, write: &Write) -> Result<ResourcePath, EngineError> {
