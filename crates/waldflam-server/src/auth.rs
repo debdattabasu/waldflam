@@ -10,11 +10,15 @@
 //!   is the `sub` claim, `request.auth.token` the whole payload.
 //! - anything malformed → INVALID_ARGUMENT
 //!
-//! **Verify** is for deployments reachable by anyone. Tokens must carry a
-//! real RS256 signature from a key published at the configured JWKS
-//! endpoint, and must match the configured issuer and audience. The `owner`
-//! backdoor does not exist here — admin comes only from a configured shared
-//! secret, and if none is set, nothing is admin.
+//! **Verify** is for deployments reachable by anyone. Every token must carry
+//! a real RS256 signature, from one of three places: waldflam's own issuer
+//! (see `credentials.rs`), a registered service account, or a configured
+//! external identity provider. The `owner` backdoor does not exist here.
+//!
+//! Admin in verified mode is a *service account* — a signed, expiring,
+//! revocable, project-scoped credential. A shared secret remains available
+//! for deployments that want one, and is the weaker option precisely because
+//! it names nobody and never expires.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,14 +29,27 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tonic::Status;
 
+use crate::credentials::{Credentials, Resolved};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Authorization {
     /// No credentials: rules see `request.auth == null`.
     Unauthenticated,
-    /// `Bearer owner`: full bypass, like a server/Admin SDK.
-    Admin,
-    /// Decoded (unverified) JWT claims payload.
+    /// Full bypass, like a server/Admin SDK.
+    Admin(Admin),
+    /// A user identity: claims become `request.auth`.
     User(JwtClaims),
+}
+
+/// Who is acting as admin, and over what.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Admin {
+    /// The service account's email. `None` for credentials that name nobody —
+    /// the emulator's `owner` and the shared secret.
+    pub subject: Option<String>,
+    /// Project the credential is confined to. `None` means unconfined, which
+    /// only the nameless credentials are.
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +58,10 @@ pub struct JwtClaims {
     pub uid: Option<String>,
     /// The entire decoded payload — becomes `request.auth.token`.
     pub payload: serde_json::Map<String, serde_json::Value>,
+    /// Project the token was issued for, when the issuer binds one. `None`
+    /// leaves the identity unconfined, which is what emulator-mode tokens
+    /// and third-party tokens are.
+    pub project_id: Option<String>,
 }
 
 /// How incoming credentials are judged. Cheap to clone; share one per server.
@@ -79,6 +100,27 @@ impl AuthPolicy {
 }
 
 impl Authorization {
+    /// Narrows a credential to the project being accessed.
+    ///
+    /// A credential issued for one project must not carry into another, or a
+    /// multi-project deployment would let any tenant's user authenticate
+    /// against every other tenant's data. Mismatches become anonymous rather
+    /// than an error: rules then decide, and they deny by default.
+    ///
+    /// Unconfined credentials — emulator `owner`, the shared secret, tokens
+    /// from an external issuer that binds no project — pass through, because
+    /// there is nothing to compare.
+    pub fn for_project(&self, project_id: &str) -> Self {
+        let confined_elsewhere = match self {
+            Self::Admin(admin) => admin.project_id.as_deref().is_some_and(|p| p != project_id),
+            Self::User(claims) => claims.project_id.as_deref().is_some_and(|p| p != project_id),
+            Self::Unauthenticated => false,
+        };
+        if confined_elsewhere { Self::Unauthenticated } else { self.clone() }
+    }
+}
+
+impl Authorization {
     /// Extracts credentials from gRPC request metadata under emulator rules.
     pub fn from_metadata(metadata: &tonic::metadata::MetadataMap) -> Result<Self, Status> {
         let header = metadata.get("authorization").and_then(|v| v.to_str().ok());
@@ -96,7 +138,7 @@ impl Authorization {
             .map(|_| &header[7..])
             .ok_or_else(|| Status::invalid_argument("expected Bearer authorization"))?;
         if token.eq_ignore_ascii_case("owner") {
-            return Ok(Self::Admin);
+            return Ok(Self::Admin(Admin::default()));
         }
         parse_unsigned_jwt(token)
             .map(Self::User)
@@ -105,8 +147,23 @@ impl Authorization {
 }
 
 /// Settings for verified mode.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct VerifyConfig {
+    /// An identity provider to trust *in addition to* waldflam's own issuer.
+    /// `None` when waldflam issues every token itself, which needs no
+    /// configuration at all.
+    pub external: Option<ExternalIssuer>,
+    /// Shared secret granting admin. Weaker than a service account — it names
+    /// nobody, never expires, and rotating it means a restart — so it is
+    /// opt-in and documented as the lesser option. `None` leaves service
+    /// accounts as the only route to admin.
+    pub admin_token: Option<String>,
+}
+
+/// A third-party issuer whose tokens are accepted, e.g. Firebase Auth for a
+/// deployment migrating off it.
+#[derive(Clone, Debug)]
+pub struct ExternalIssuer {
     /// Required `iss` claim. For Firebase Auth:
     /// `https://securetoken.google.com/<project-id>`.
     pub issuer: String,
@@ -115,14 +172,15 @@ pub struct VerifyConfig {
     /// Where signing keys are published in JWK Set form. For Firebase Auth:
     /// `https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com`.
     pub jwks_url: String,
-    /// Shared secret granting admin, for server-side callers. `None` means
-    /// no request can reach admin — rules apply to everyone.
-    pub admin_token: Option<String>,
 }
 
-/// Verifies RS256 tokens against keys published at a JWKS endpoint.
+/// Verifies RS256 tokens: waldflam's own first, then a service account's own
+/// assertion, then the external issuer's.
 pub struct Verifier {
     config: VerifyConfig,
+    /// waldflam's own credential system. `None` only in unit tests, which
+    /// exercise the external-issuer path without a database.
+    credentials: Option<Arc<Credentials>>,
     http: reqwest::Client,
     keys: RwLock<KeyCache>,
 }
@@ -158,14 +216,24 @@ struct Jwk {
 
 impl Verifier {
     /// Fetches keys lazily on the first token that needs them.
-    pub fn new(config: VerifyConfig) -> Self {
-        Self { config, http: reqwest::Client::new(), keys: RwLock::new(KeyCache::default()) }
+    pub fn new(config: VerifyConfig, credentials: Arc<Credentials>) -> Self {
+        Self {
+            config,
+            credentials: Some(credentials),
+            http: reqwest::Client::new(),
+            keys: RwLock::new(KeyCache::default()),
+        }
     }
 
     /// Uses a fixed key set instead of fetching — for pinned deployments
     /// that would rather ship keys than reach out, and for tests.
     pub fn with_jwks(config: VerifyConfig, jwks: &str) -> Result<Self, String> {
-        let verifier = Self::new(config);
+        let verifier = Self {
+            config,
+            credentials: None,
+            http: reqwest::Client::new(),
+            keys: RwLock::new(KeyCache::default()),
+        };
         let parsed = parse_jwks(jwks)?;
         {
             let mut cache = verifier.keys.write().expect("key cache");
@@ -185,12 +253,40 @@ impl Verifier {
             .map(|_| &header[7..])
             .ok_or_else(|| Status::unauthenticated("expected Bearer authorization"))?;
 
-        // Admin is a configured secret, never the emulator's `owner`.
+        // The shared secret, if one is configured. Never the emulator's
+        // `owner`, which is a well-known string and therefore not a secret.
         if let Some(expected) = self.config.admin_token.as_deref()
             && secret_eq(token, expected)
         {
-            return Ok(Authorization::Admin);
+            return Ok(Authorization::Admin(Admin::default()));
         }
+
+        // waldflam's own tokens and service-account assertions. `None` here
+        // means the token belongs to somebody else, so fall through; an error
+        // means it is ours and it is bad, which must not fall through.
+        if let Some(credentials) = &self.credentials
+            && let Some(resolved) = credentials.resolve(token).await?
+        {
+            return Ok(match resolved {
+                Resolved::ServiceAccount { client_email, project_id } => {
+                    Authorization::Admin(Admin {
+                        subject: Some(client_email),
+                        project_id: Some(project_id),
+                    })
+                }
+                Resolved::User { uid, project_id, claims } => Authorization::User(JwtClaims {
+                    uid: Some(uid),
+                    payload: claims,
+                    project_id: Some(project_id),
+                }),
+            });
+        }
+
+        let Some(external) = &self.config.external else {
+            return Err(Status::unauthenticated(
+                "token was not issued by this deployment and no external issuer is configured",
+            ));
+        };
 
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| Status::unauthenticated(format!("invalid token header: {e}")))?;
@@ -202,8 +298,8 @@ impl Verifier {
 
         let key = self.key_for(&kid).await?;
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-        validation.set_issuer(&[&self.config.issuer]);
-        validation.set_audience(&[&self.config.audience]);
+        validation.set_issuer(&[&external.issuer]);
+        validation.set_audience(&[&external.audience]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.leeway = CLOCK_LEEWAY_SECONDS;
 
@@ -223,7 +319,10 @@ impl Verifier {
             .filter(|sub| !sub.is_empty())
             .ok_or_else(|| Status::unauthenticated("token has no subject"))?
             .to_owned();
-        Ok(Authorization::User(JwtClaims { uid: Some(uid), payload }))
+        // The audience was just checked against the configured one, so it is
+        // the project this identity belongs to.
+        let project_id = Some(external.audience.clone());
+        Ok(Authorization::User(JwtClaims { uid: Some(uid), payload, project_id }))
     }
 
     /// Looks up a signing key, refetching the set once if the `kid` is
@@ -248,9 +347,12 @@ impl Verifier {
     }
 
     async fn refresh(&self) -> Result<(), Status> {
+        let Some(external) = &self.config.external else {
+            return Err(Status::unauthenticated("no external issuer is configured"));
+        };
         let body = self
             .http
-            .get(&self.config.jwks_url)
+            .get(&external.jwks_url)
             .send()
             .await
             .and_then(|response| response.error_for_status())
@@ -314,12 +416,21 @@ fn parse_unsigned_jwt(token: &str) -> Result<JwtClaims, &'static str> {
     let header: serde_json::Map<String, serde_json::Value> = decode_json_segment(header)?;
     match header.get("alg").and_then(|v| v.as_str()) {
         Some("none") => {}
-        _ => return Err("expected alg 'none'"),
+        // Emulator mode verifies nothing, so a signed token has no meaning
+        // here and silently trusting it would misrepresent what this mode is.
+        Some(_) => {
+            return Err("this server is in emulator mode (WALDFLAM_AUTH=emulator), which \
+                               accepts only unsigned `alg: none` tokens; set WALDFLAM_AUTH=verify \
+                               to accept signed ones");
+        }
+        None => return Err("expected alg 'none'"),
     }
 
     let payload: serde_json::Map<String, serde_json::Value> = decode_json_segment(payload)?;
     let uid = payload.get("sub").and_then(|v| v.as_str()).map(str::to_owned);
-    Ok(JwtClaims { uid, payload })
+    // Emulator tokens bind no project: they are unverified, so a project
+    // claim on one would assert nothing.
+    Ok(JwtClaims { uid, payload, project_id: None })
 }
 
 fn decode_json_segment(
@@ -376,10 +487,12 @@ ovX42z10ITdIZCEk527/S+k=\n\
 
     fn policy(admin_token: Option<&str>) -> AuthPolicy {
         let config = VerifyConfig {
-            issuer: ISSUER.into(),
-            audience: AUDIENCE.into(),
-            // Never reached: the key set is supplied up front.
-            jwks_url: "http://127.0.0.1:1/unused".into(),
+            external: Some(ExternalIssuer {
+                issuer: ISSUER.into(),
+                audience: AUDIENCE.into(),
+                // Never reached: the key set is supplied up front.
+                jwks_url: "http://127.0.0.1:1/unused".into(),
+            }),
             admin_token: admin_token.map(str::to_owned),
         };
         AuthPolicy::Verify(Arc::new(
@@ -485,7 +598,7 @@ ovX42z10ITdIZCEk527/S+k=\n\
         let policy = policy(Some("s3cret"));
         assert_eq!(
             policy.authorize(Some("Bearer s3cret")).await.unwrap(),
-            Authorization::Admin,
+            Authorization::Admin(Admin::default()),
             "the configured secret grants admin"
         );
         assert!(
@@ -493,6 +606,45 @@ ovX42z10ITdIZCEk527/S+k=\n\
             "a near-miss secret is not admin"
         );
         assert!(policy.authorize(Some("Bearer owner")).await.is_err());
+    }
+
+    /// A credential issued for one project must not carry into another, or a
+    /// deployment hosting two projects would leak every identity across them.
+    #[test]
+    fn credentials_do_not_cross_project_boundaries() {
+        let confined = |project: &str| {
+            Authorization::Admin(Admin {
+                subject: Some("backend@one.iam.waldflam.local".into()),
+                project_id: Some(project.into()),
+            })
+        };
+        assert!(matches!(confined("one").for_project("one"), Authorization::Admin(_)));
+        assert_eq!(
+            confined("one").for_project("two"),
+            Authorization::Unauthenticated,
+            "one project's service account is nobody in another"
+        );
+
+        let user = |project: Option<&str>| {
+            Authorization::User(JwtClaims {
+                uid: Some("alice".into()),
+                payload: Default::default(),
+                project_id: project.map(str::to_owned),
+            })
+        };
+        assert_eq!(user(Some("one")).for_project("two"), Authorization::Unauthenticated);
+        assert!(matches!(user(Some("one")).for_project("one"), Authorization::User(_)));
+        assert!(
+            matches!(user(None).for_project("anything"), Authorization::User(_)),
+            "a token that binds no project is not confined by one"
+        );
+
+        // The nameless credentials are unconfined, so emulator workflows and
+        // the shared secret keep working across projects.
+        assert!(matches!(
+            Authorization::Admin(Admin::default()).for_project("anything"),
+            Authorization::Admin(_)
+        ));
     }
 
     #[tokio::test]
@@ -507,7 +659,10 @@ ovX42z10ITdIZCEk527/S+k=\n\
     #[tokio::test]
     async fn emulator_mode_is_unchanged() {
         let emulator = AuthPolicy::Emulator;
-        assert_eq!(emulator.authorize(Some("Bearer owner")).await.unwrap(), Authorization::Admin);
+        assert_eq!(
+            emulator.authorize(Some("Bearer owner")).await.unwrap(),
+            Authorization::Admin(Admin::default())
+        );
         assert!(!emulator.guards_admin_api(), "the emulator leaves its admin API open");
         assert!(policy(None).guards_admin_api(), "verified mode guards it");
     }
@@ -530,7 +685,11 @@ mod tests {
     #[test]
     fn owner_is_admin_case_insensitively() {
         for h in ["Bearer owner", "bearer owner", "Bearer OWNER", "BEARER Owner"] {
-            assert_eq!(Authorization::from_header(Some(h)).unwrap(), Authorization::Admin, "{h}");
+            assert_eq!(
+                Authorization::from_header(Some(h)).unwrap(),
+                Authorization::Admin(Admin::default()),
+                "{h}"
+            );
         }
     }
 

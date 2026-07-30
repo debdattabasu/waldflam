@@ -13,6 +13,14 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/debdattabasu/waldflam"
 
+# RSA key generation is dominated by bignum arithmetic, which is unusably
+# slow unoptimized — tens of seconds per key, paid by every `cargo test` that
+# creates a credential. Optimizing just that crate keeps debug builds honest
+# about our own code while making key generation take a moment instead of a
+# coffee break.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
 [workspace.dependencies]
 waldflam-proto = { path = "crates/waldflam-proto" }
 waldflam-engine = { path = "crates/waldflam-engine" }

@@ -148,8 +148,10 @@ pub async fn check(
     auth: &Authorization,
     request: AccessRequest<'_>,
 ) -> Result<(), Status> {
+    // A credential confined to another project is nobody here.
+    let auth = &auth.for_project(&request.database.project_id);
     // Admin bypasses rules entirely.
-    if matches!(auth, Authorization::Admin) {
+    if matches!(auth, Authorization::Admin(_)) {
         return Ok(());
     }
     let Some(ruleset) = registry.get(request.database) else {
@@ -242,7 +244,8 @@ pub async fn check_writes(
     writes: &[waldflam_proto::v1::Write],
 ) -> Result<(), Status> {
     use waldflam_proto::v1::write::Operation as WriteOp;
-    if matches!(auth, Authorization::Admin) {
+    let auth = &auth.for_project(&database.project_id);
+    if matches!(auth, Authorization::Admin(_)) {
         return Ok(());
     }
     if registry.get(database).is_none() {

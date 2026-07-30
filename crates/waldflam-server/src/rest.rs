@@ -28,6 +28,7 @@ pub struct RestState {
     pub pool: DescriptorPool,
     pub sessions: std::sync::Arc<crate::webchannel::WebChannelSessions>,
     pub triggers: std::sync::Arc<crate::functions::TriggerRegistry>,
+    pub credentials: std::sync::Arc<crate::credentials::Credentials>,
 }
 
 /// Carries the caller's credentials into the gRPC request the service sees.
@@ -53,13 +54,19 @@ fn authed<T>(message: T, headers: &HeaderMap) -> tonic::Request<T> {
 /// The emulator leaves these open because it is a local development tool; a
 /// server anyone can reach must not, so verified mode requires admin. In
 /// emulator mode this is a no-op, keeping the SDK test harnesses working.
-async fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<(), Response> {
+async fn require_admin(
+    state: &RestState,
+    headers: &HeaderMap,
+    project: &str,
+) -> Result<(), Response> {
     if !state.svc.auth.guards_admin_api() {
         return Ok(());
     }
     let header = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
-    match state.svc.auth.authorize(header).await {
-        Ok(crate::auth::Authorization::Admin) => Ok(()),
+    // Scoped to the project in the URL: a service account for one project
+    // must not be able to load rules into — or erase — another's.
+    match state.svc.auth.authorize(header).await.map(|auth| auth.for_project(project)) {
+        Ok(crate::auth::Authorization::Admin(_)) => Ok(()),
         _ => Err(status_response(&Status::permission_denied(
             "admin credentials required for this endpoint",
         ))),
@@ -78,6 +85,14 @@ pub async fn v1_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Identity endpoints share the `/v1/` prefix with Firestore's REST
+    // surface but are not Firestore RPCs, so they are answered before the
+    // proto3-JSON dispatcher — which would read them as `resource:method`.
+    match path.as_str() {
+        "accounts:signInWithCustomToken" => return sign_in_with_custom_token(&state, &body).await,
+        "token" => return refresh_token(&state, &body).await,
+        _ => {}
+    }
     match dispatch(&state, &path, &body, &headers).await {
         Ok(json) => {
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response()
@@ -206,6 +221,118 @@ pub async fn health() -> &'static str {
     "Ok\n"
 }
 
+/// `POST /oauth2/v4/token` — the OAuth2 JWT-bearer grant.
+///
+/// A Google auth library that honours the key file's `token_uri` lands here:
+/// it signs an assertion with the service account's private key and trades it
+/// for a short-lived access token. Libraries that instead send the assertion
+/// straight through as a bearer are handled too — `auth.rs` accepts either —
+/// because which of the two a given client picks is a detail of that
+/// client's version, not something a server can insist on.
+pub async fn oauth_token(State(state): State<RestState>, body: Bytes) -> Response {
+    let form: std::collections::HashMap<String, String> =
+        form_urlencoded::parse(&body).into_owned().collect();
+    let grant = form.get("grant_type").map(String::as_str).unwrap_or_default();
+    if grant != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            &format!("expected the jwt-bearer grant, got {grant:?}"),
+        );
+    }
+    let Some(assertion) = form.get("assertion") else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing assertion");
+    };
+    match state.credentials.exchange_assertion(assertion).await {
+        Ok((access_token, expires_in)) => json_ok(serde_json::json!({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+        })),
+        Err(status) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", status.message()),
+    }
+}
+
+/// `GET /.well-known/jwks.json` — the public keys for tokens waldflam issues,
+/// so its own verifier and anything else that speaks OIDC can check them.
+pub async fn jwks(State(state): State<RestState>) -> Response {
+    match state.credentials.jwks().await {
+        Ok(keys) => json_ok(keys),
+        Err(status) => status_response(&status),
+    }
+}
+
+/// `GET /.well-known/openid-configuration` — lets a verifier configure itself
+/// from the issuer URL alone.
+pub async fn openid_configuration(State(state): State<RestState>) -> Response {
+    json_ok(state.credentials.discovery().await)
+}
+
+/// `POST /v1/accounts:signInWithCustomToken` — exchanges a custom token
+/// minted by a service account for an ID token, in the identitytoolkit
+/// response shape the Firebase clients expect.
+async fn sign_in_with_custom_token(state: &RestState, body: &[u8]) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        token: String,
+    }
+    let parsed: Body = match serde_json::from_slice(body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return status_response(&Status::invalid_argument(format!("invalid request: {e}")));
+        }
+    };
+    match state.credentials.sign_in_with_custom_token(&parsed.token).await {
+        Ok(signed_in) => json_ok(serde_json::json!({
+            "kind": "identitytoolkit#VerifyCustomTokenResponse",
+            "idToken": signed_in.id_token,
+            "refreshToken": signed_in.refresh_token,
+            "expiresIn": signed_in.expires_in.to_string(),
+            "isNewUser": false,
+        })),
+        Err(status) => status_response(&status),
+    }
+}
+
+/// `POST /v1/token` — trades a refresh token for a fresh ID token, in the
+/// securetoken response shape.
+async fn refresh_token(state: &RestState, body: &[u8]) -> Response {
+    // Sent form-encoded by the client SDKs, but accept JSON too since this
+    // endpoint is equally likely to be called by hand.
+    let token = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => json.get("refresh_token").and_then(|v| v.as_str()).map(str::to_owned),
+        Err(_) => form_urlencoded::parse(body)
+            .find(|(key, _)| key == "refresh_token")
+            .map(|(_, value)| value.into_owned()),
+    };
+    let Some(token) = token else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "missing refresh_token");
+    };
+    match state.credentials.refresh(&token).await {
+        Ok(signed_in) => json_ok(serde_json::json!({
+            "access_token": signed_in.id_token,
+            "id_token": signed_in.id_token,
+            "refresh_token": signed_in.refresh_token,
+            "expires_in": signed_in.expires_in.to_string(),
+            "token_type": "Bearer",
+            "user_id": signed_in.uid,
+            "project_id": signed_in.project_id,
+        })),
+        Err(status) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", status.message()),
+    }
+}
+
+fn json_ok(body: serde_json::Value) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+/// OAuth2's own error shape, which is not the Google API one — a client's
+/// token machinery parses this, not `{"error": {...}}`.
+fn oauth_error(code: StatusCode, error: &str, description: &str) -> Response {
+    let body = serde_json::json!({ "error": error, "error_description": description });
+    (code, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
 /// `PUT /emulator/v1/projects/{project}:securityRules` — the endpoint
 /// `@firebase/rules-unit-testing` uses to load rules. Body:
 /// `{"rules": {"files": [{"name": ..., "content": "<rules source>"}]}}`.
@@ -215,10 +342,10 @@ pub async fn set_security_rules(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(denied) = require_admin(&state, &headers).await {
+    let project = project.trim_end_matches(":securityRules");
+    if let Err(denied) = require_admin(&state, &headers, project).await {
         return denied;
     }
-    let project = project.trim_end_matches(":securityRules");
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -248,10 +375,11 @@ pub async fn set_security_rules(
 /// Functions triggers. Body: `{"triggers": [{id, pattern, event, endpoint}]}`.
 pub async fn set_triggers(
     State(state): State<RestState>,
+    Path(project): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(denied) = require_admin(&state, &headers).await {
+    if let Err(denied) = require_admin(&state, &headers, &project).await {
         return denied;
     }
     #[derive(serde::Deserialize)]
@@ -280,7 +408,7 @@ pub async fn clear_data(
     Path((project, database)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(denied) = require_admin(&state, &headers).await {
+    if let Err(denied) = require_admin(&state, &headers, &project).await {
         return denied;
     }
     let db = waldflam_engine::path::DatabaseName::new(project, database);

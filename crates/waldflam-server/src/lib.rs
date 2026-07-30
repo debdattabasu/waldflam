@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod credentials;
 pub mod functions;
 pub mod listen;
 pub mod rest;
@@ -18,7 +19,12 @@ use crate::service::FirestoreService;
 /// Serve every protocol surface on one port, like the official emulator:
 /// native gRPC over h2c (all SDKs in emulator mode), REST v1 in proto3-JSON
 /// (JS lite + browser unary), and a health check at `/`.
-pub async fn serve(addr: SocketAddr, store: Store, auth: auth::AuthPolicy) -> anyhow::Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    store: Store,
+    auth: auth::AuthPolicy,
+    credentials: Arc<credentials::Credentials>,
+) -> anyhow::Result<()> {
     let svc = Arc::new(FirestoreService::with_auth(store.clone(), auth));
     let pool = rest::descriptor_pool();
     let triggers: Arc<functions::TriggerRegistry> = Default::default();
@@ -26,13 +32,21 @@ pub async fn serve(addr: SocketAddr, store: Store, auth: auth::AuthPolicy) -> an
     // Republishes other instances' commits onto this instance's hub, so
     // Listen streams here see writes applied anywhere in the cluster.
     waldflam_engine::fanout::spawn(store, svc.hub_handle());
-    let rest_state =
-        rest::RestState { svc: svc.clone(), pool, sessions: Default::default(), triggers };
+    let rest_state = rest::RestState {
+        svc: svc.clone(),
+        pool,
+        sessions: Default::default(),
+        triggers,
+        credentials,
+    };
 
     let grpc = tonic::service::Routes::new(FirestoreServer::from_arc(svc));
     let rest_router = axum::Router::new()
         .route("/", axum::routing::get(rest::health))
         .route("/v1/{*path}", axum::routing::post(rest::v1_post))
+        .route("/oauth2/v4/token", axum::routing::post(rest::oauth_token))
+        .route("/.well-known/jwks.json", axum::routing::get(rest::jwks))
+        .route("/.well-known/openid-configuration", axum::routing::get(rest::openid_configuration))
         .route("/emulator/v1/projects/{project}", axum::routing::put(rest::set_security_rules))
         .route(
             "/emulator/v1/projects/{project}/databases/{database}/documents",

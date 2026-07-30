@@ -46,7 +46,15 @@ async fn boot() -> (FirestoreClient<tonic::transport::Channel>, String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    tokio::spawn(waldflam_server::serve(addr, store, Default::default()));
+    tokio::spawn(waldflam_server::serve(
+        addr,
+        store.clone(),
+        Default::default(),
+        std::sync::Arc::new(waldflam_server::credentials::Credentials::new(
+            store,
+            format!("http://{addr}"),
+        )),
+    ));
     let client = loop {
         match FirestoreClient::connect(format!("http://{addr}")).await {
             Ok(c) => break c,

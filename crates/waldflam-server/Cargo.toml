@@ -29,3 +29,9 @@ jsonwebtoken = "9"
 form_urlencoded = "1"
 prost = { workspace = true }
 prost-reflect = { version = "0.16", features = ["serde"] }
+rsa = "0.9"
+rand = "0.8"
+
+[dev-dependencies]
+jsonwebtoken = "9"
+tonic.workspace = true
