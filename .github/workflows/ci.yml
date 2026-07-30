@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Both jobs talk to the replica set that docker-compose.yml brings up.
+  WALDFLAM_TEST_MONGO: mongodb://127.0.0.1:27017/?directConnection=true
+
+jobs:
+  test:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The engine and server integration tests need a real MongoDB; they
+      # fail rather than skip without one.
+      - name: Start MongoDB replica set
+        run: docker compose up -d --wait
+
+      - run: cargo test --workspace
+
+  conformance:
+    name: SDK conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The Rust harness is its own crate, outside the workspace.
+          workspaces: |
+            .
+            conformance/rust
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: conformance/go/go.mod
+          cache-dependency-path: conformance/go/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: conformance/js/package-lock.json
+
+      - name: Start MongoDB replica set
+        run: docker compose up -d --wait
+
+      - name: Build and start waldflam
+        run: |
+          cargo build --bin waldflam
+          nohup ./target/debug/waldflam > server.log 2>&1 &
+          for _ in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/8080) >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "server never came up"; cat server.log; exit 1
+        env:
+          WALDFLAM_LISTEN: 127.0.0.1:8080
+          WALDFLAM_MONGO: mongodb://127.0.0.1:27017/?directConnection=true
+
+      # Each suite is its own step so a failure names the SDK that broke.
+      # Every one drives an official, unmodified client library.
+      - name: Go client
+        working-directory: conformance/go
+        run: go run .
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+
+      - name: firestore-rs client
+        working-directory: conformance/rust
+        run: cargo run
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+
+      - name: Install JS SDK
+        working-directory: conformance/js
+        run: npm ci
+
+      - name: JS client (Node, gRPC)
+        working-directory: conformance/js
+        run: node main.mjs
+
+      - name: JS lite client (REST)
+        working-directory: conformance/js
+        run: node lite.mjs
+
+      - name: JS client (browser, WebChannel)
+        working-directory: conformance/js
+        run: node --conditions=browser browser.mjs
+
+      - name: Security rules
+        working-directory: conformance/js
+        run: node rules.mjs
+
+      - name: Cloud Functions triggers
+        working-directory: conformance/js
+        run: node triggers.mjs
+
+      - name: Server log
+        if: failure()
+        run: cat server.log
