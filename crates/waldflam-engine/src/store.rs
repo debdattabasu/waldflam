@@ -130,6 +130,46 @@ impl Store {
         decode_row(row)
     }
 
+    /// All documents in one collection (unsorted; callers order).
+    pub async fn list_collection(
+        &self,
+        database: &DatabaseName,
+        collection_path: &ResourcePath,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        self.collect_rows(
+            self.collection(database)
+                .find(doc! { "collection_path": collection_path.to_string() })
+                .await?,
+        )
+        .await
+    }
+
+    /// All documents in every collection with this id (collection group).
+    pub async fn list_collection_group(
+        &self,
+        database: &DatabaseName,
+        collection_id: &str,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        self.collect_rows(
+            self.collection(database)
+                .find(doc! { "collection_id": collection_id })
+                .await?,
+        )
+        .await
+    }
+
+    async fn collect_rows(
+        &self,
+        mut cursor: mongodb::Cursor<DocRow>,
+    ) -> Result<Vec<StoredDocument>, EngineError> {
+        use futures::TryStreamExt;
+        let mut out = Vec::new();
+        while let Some(row) = cursor.try_next().await? {
+            out.push(decode_row(row)?);
+        }
+        Ok(out)
+    }
+
     /// Returns whether the document existed.
     pub async fn delete_document(
         &self,

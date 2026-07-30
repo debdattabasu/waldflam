@@ -5,11 +5,14 @@
 //! values for implicitly indexed fields, `$payloadFields` = the rest.
 //! See docs/architecture.md §6.
 
+pub mod commit;
 pub mod encoding;
 pub mod error;
+pub mod fields;
 pub mod index_key;
 pub mod order;
 pub mod path;
+pub mod query;
 pub mod store;
 
 pub use error::EngineError;

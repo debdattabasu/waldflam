@@ -6,8 +6,12 @@ pub enum EngineError {
     AlreadyExists(String),
     #[error("transaction aborted")]
     Aborted,
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("not implemented: {0}")]
+    Unimplemented(&'static str),
     #[error(transparent)]
     Mongo(#[from] mongodb::error::Error),
 }

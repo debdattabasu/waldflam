@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::pin::Pin;
 
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
-use waldflam_engine::path::ResourceName;
+use waldflam_engine::path::{DatabaseName, ResourceName};
 use waldflam_engine::store::{Store, StoredDocument};
 use waldflam_proto::v1::firestore_server::Firestore;
 use waldflam_proto::v1::*;
@@ -19,6 +20,13 @@ impl FirestoreService {
     pub fn new(store: Store) -> Self {
         Self { store }
     }
+}
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_micros() as i64
 }
 
 fn timestamp_from_us(us: i64) -> prost_types::Timestamp {
@@ -43,7 +51,9 @@ fn engine_status(err: waldflam_engine::EngineError) -> Status {
         NotFound(m) => Status::not_found(m),
         AlreadyExists(m) => Status::already_exists(m),
         Aborted => Status::aborted("transaction contention"),
+        FailedPrecondition(m) => Status::failed_precondition(m),
         InvalidArgument(m) => Status::invalid_argument(m),
+        Unimplemented(m) => Status::unimplemented(m),
         Mongo(e) => Status::internal(format!("storage: {e}")),
     }
 }
@@ -103,9 +113,42 @@ impl Firestore for FirestoreService {
 
     async fn batch_get_documents(
         &self,
-        _request: Request<BatchGetDocumentsRequest>,
+        request: Request<BatchGetDocumentsRequest>,
     ) -> Result<Response<Self::BatchGetDocumentsStream>, Status> {
-        Err(Status::unimplemented("BatchGetDocuments"))
+        let req = request.into_inner();
+        let database = DatabaseName::parse(&req.database)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let read_time = timestamp_from_us(now_us());
+
+        // Each distinct name gets exactly one found/missing answer (the Go
+        // client fans a single answer out to duplicate request entries).
+        let mut seen = HashSet::new();
+        let mut responses = Vec::new();
+        for name in &req.documents {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let parsed = ResourceName::parse_document(name)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            // TODO(consistency): honor transaction / new_transaction / read_time.
+            let result = match self
+                .store
+                .get_document(&database, &parsed.path)
+                .await
+                .map_err(engine_status)?
+            {
+                Some(doc) => batch_get_documents_response::Result::Found(
+                    to_wire_document(&parsed, doc),
+                ),
+                None => batch_get_documents_response::Result::Missing(name.clone()),
+            };
+            responses.push(Ok(BatchGetDocumentsResponse {
+                result: Some(result),
+                read_time: Some(read_time),
+                ..Default::default()
+            }));
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
     }
 
     async fn begin_transaction(
@@ -117,9 +160,29 @@ impl Firestore for FirestoreService {
 
     async fn commit(
         &self,
-        _request: Request<CommitRequest>,
+        request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        Err(Status::unimplemented("Commit"))
+        let req = request.into_inner();
+        if !req.transaction.is_empty() {
+            return Err(Status::unimplemented("transactional commits (M2)"));
+        }
+        let database = DatabaseName::parse(&req.database)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let now = now_us();
+        let outcomes =
+            waldflam_engine::commit::apply_commit(&self.store, &database, &req.writes, now)
+                .await
+                .map_err(engine_status)?;
+        Ok(Response::new(CommitResponse {
+            write_results: outcomes
+                .into_iter()
+                .map(|o| WriteResult {
+                    update_time: Some(timestamp_from_us(o.update_time_us)),
+                    transform_results: o.transform_results,
+                })
+                .collect(),
+            commit_time: Some(timestamp_from_us(now)),
+        }))
     }
 
     async fn rollback(
@@ -131,9 +194,40 @@ impl Firestore for FirestoreService {
 
     async fn run_query(
         &self,
-        _request: Request<RunQueryRequest>,
+        request: Request<RunQueryRequest>,
     ) -> Result<Response<Self::RunQueryStream>, Status> {
-        Err(Status::unimplemented("RunQuery"))
+        let req = request.into_inner();
+        let parent = ResourceName::parse(&req.parent)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let Some(run_query_request::QueryType::StructuredQuery(query)) = req.query_type else {
+            return Err(Status::invalid_argument("missing structured_query"));
+        };
+        // TODO(consistency): honor transaction / new_transaction / read_time.
+        let docs =
+            waldflam_engine::query::run_query(&self.store, &parent.database, &parent.path, &query)
+                .await
+                .map_err(engine_status)?;
+
+        let read_time = timestamp_from_us(now_us());
+        let mut responses: Vec<Result<RunQueryResponse, Status>> = docs
+            .into_iter()
+            .map(|doc| {
+                let name = ResourceName { database: parent.database.clone(), path: doc.path.clone() };
+                Ok(RunQueryResponse {
+                    document: Some(to_wire_document(&name, doc)),
+                    read_time: Some(read_time),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if responses.is_empty() {
+            // No results: a single read_time-only response, then EOF.
+            responses.push(Ok(RunQueryResponse {
+                read_time: Some(read_time),
+                ..Default::default()
+            }));
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
     }
 
     async fn run_aggregation_query(

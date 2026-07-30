@@ -56,7 +56,7 @@ async fn serves_firestore_service_over_h2c() {
 
     // Unimplemented RPCs still answer cleanly.
     let status = client
-        .commit(waldflam_proto::v1::CommitRequest::default())
+        .begin_transaction(waldflam_proto::v1::BeginTransactionRequest::default())
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unimplemented);

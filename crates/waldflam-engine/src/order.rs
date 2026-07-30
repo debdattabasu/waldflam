@@ -63,6 +63,12 @@ fn vector_values(m: &MapValue) -> Option<&ArrayValue> {
     }
 }
 
+/// Whether two values share a type rank (int and double share Number) —
+/// the "same category" test behind type-bounded inequality filters.
+pub fn same_type_rank(a: &Value, b: &Value) -> bool {
+    rank(a) == rank(b)
+}
+
 /// Total order over Firestore values.
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     let (ra, rb) = (rank(a), rank(b));
