@@ -8,5 +8,10 @@ license.workspace = true
 waldflam-proto = { workspace = true }
 prost-types = { workspace = true }
 mongodb = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

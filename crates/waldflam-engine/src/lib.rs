@@ -7,7 +7,9 @@
 
 pub mod encoding;
 pub mod error;
+pub mod index_key;
 pub mod order;
 pub mod path;
+pub mod store;
 
 pub use error::EngineError;

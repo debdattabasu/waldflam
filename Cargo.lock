@@ -2515,8 +2515,11 @@ name = "waldflam-engine"
 version = "0.1.0"
 dependencies = [
  "mongodb",
+ "prost",
  "prost-types",
+ "serde",
  "thiserror",
+ "tokio",
  "tracing",
  "waldflam-proto",
 ]
@@ -2546,6 +2549,7 @@ dependencies = [
  "anyhow",
  "base64",
  "futures",
+ "prost-types",
  "serde_json",
  "tokio",
  "tokio-stream",

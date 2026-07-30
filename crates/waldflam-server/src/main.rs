@@ -12,5 +12,8 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("WALDFLAM_LISTEN")
         .unwrap_or_else(|_| "0.0.0.0:8080".into())
         .parse()?;
-    waldflam_server::serve(addr).await
+    let mongo_uri = std::env::var("WALDFLAM_MONGO")
+        .unwrap_or_else(|_| "mongodb://127.0.0.1:27017/?directConnection=true".into());
+    let store = waldflam_engine::store::Store::connect(&mongo_uri).await?;
+    waldflam_server::serve(addr, store).await
 }
