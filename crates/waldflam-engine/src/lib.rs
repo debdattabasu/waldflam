@@ -5,6 +5,7 @@
 //! values for implicitly indexed fields, `$payloadFields` = the rest.
 //! See docs/architecture.md §6.
 
+pub mod encoding;
 pub mod error;
 pub mod order;
 pub mod path;
