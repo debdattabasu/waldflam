@@ -60,8 +60,8 @@ pub enum Decision {
 ///
 /// `path` is the resource path *below* the service root, e.g.
 /// `["databases", "(default)", "documents", "users", "alice"]`.
-pub fn evaluate<'a, H: Host>(
-    ruleset: &'a Ruleset,
+pub fn evaluate<H: Host>(
+    ruleset: &Ruleset,
     service_name: &str,
     operation: Operation,
     path: &[String],
@@ -204,10 +204,7 @@ fn match_segments(
                     return None;
                 }
                 let captured: Vec<String> = path[i..i + take].to_vec();
-                captures.push((
-                    name.clone(),
-                    Value::Path(std::sync::Arc::new(captured)),
-                ));
+                captures.push((name.clone(), Value::Path(std::sync::Arc::new(captured))));
                 i += take;
             }
         }
@@ -230,10 +227,7 @@ impl RequestBuilder {
         map.insert("auth".into(), self.auth.unwrap_or(Value::Null));
         map.insert("time".into(), self.time);
         map.insert("method".into(), Value::str(self.method.id()));
-        map.insert(
-            "path".into(),
-            Value::Path(std::sync::Arc::new(self.path)),
-        );
+        map.insert("path".into(), Value::Path(std::sync::Arc::new(self.path)));
         if let Some(resource) = self.resource {
             map.insert("resource".into(), resource);
         }

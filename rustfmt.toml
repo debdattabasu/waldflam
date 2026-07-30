@@ -1,0 +1,4 @@
+# The codebase is written in a compact style — short struct literals, calls,
+# and match arms stay on one line. Max heuristics keeps rustfmt from exploding
+# them, so formatting enforces consistency without rewriting how it reads.
+use_small_heuristics = "Max"

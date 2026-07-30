@@ -19,7 +19,7 @@
 use waldflam_proto::v1::value::ValueType;
 use waldflam_proto::v1::{MapValue, Value};
 
-use crate::encoding::{encode_f64, encode_i64, encode_number, NumberParts};
+use crate::encoding::{NumberParts, encode_f64, encode_i64, encode_number};
 
 /// Sorts below every real value: the lower scan bound for "field exists".
 pub const TAG_ABSENT: u8 = 0x04;

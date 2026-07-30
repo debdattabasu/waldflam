@@ -42,25 +42,22 @@ pub async fn v1_post(
     body: Bytes,
 ) -> Response {
     match dispatch(&state, &path, &body).await {
-        Ok(json) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json,
-        )
-            .into_response(),
+        Ok(json) => {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response()
+        }
         Err(status) => status_response(&status),
     }
 }
 
 async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, Status> {
-    let (resource, method) = path
-        .rsplit_once(':')
-        .ok_or_else(|| Status::not_found("unknown REST path"))?;
+    let (resource, method) =
+        path.rsplit_once(':').ok_or_else(|| Status::not_found("unknown REST path"))?;
     let body = if body.is_empty() { b"{}" } else { body };
 
     match method {
         "commit" => {
-            let mut req: CommitRequest = json_to_message(state, "google.firestore.v1.CommitRequest", body)?;
+            let mut req: CommitRequest =
+                json_to_message(state, "google.firestore.v1.CommitRequest", body)?;
             req.database = database_of(resource)?;
             let resp = state.svc.commit(tonic::Request::new(req)).await?;
             message_to_json(state, "google.firestore.v1.CommitResponse", &resp.into_inner())
@@ -69,11 +66,8 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
             let mut req: BatchGetDocumentsRequest =
                 json_to_message(state, "google.firestore.v1.BatchGetDocumentsRequest", body)?;
             req.database = database_of(resource)?;
-            let stream = state
-                .svc
-                .batch_get_documents(tonic::Request::new(req))
-                .await?
-                .into_inner();
+            let stream =
+                state.svc.batch_get_documents(tonic::Request::new(req)).await?.into_inner();
             collect_json(state, "google.firestore.v1.BatchGetDocumentsResponse", stream).await
         }
         "runQuery" => {
@@ -87,11 +81,8 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
             let mut req: RunAggregationQueryRequest =
                 json_to_message(state, "google.firestore.v1.RunAggregationQueryRequest", body)?;
             req.parent = resource.to_owned();
-            let stream = state
-                .svc
-                .run_aggregation_query(tonic::Request::new(req))
-                .await?
-                .into_inner();
+            let stream =
+                state.svc.run_aggregation_query(tonic::Request::new(req)).await?.into_inner();
             collect_json(state, "google.firestore.v1.RunAggregationQueryResponse", stream).await
         }
         "beginTransaction" => {
@@ -99,7 +90,11 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
                 json_to_message(state, "google.firestore.v1.BeginTransactionRequest", body)?;
             req.database = database_of(resource)?;
             let resp = state.svc.begin_transaction(tonic::Request::new(req)).await?;
-            message_to_json(state, "google.firestore.v1.BeginTransactionResponse", &resp.into_inner())
+            message_to_json(
+                state,
+                "google.firestore.v1.BeginTransactionResponse",
+                &resp.into_inner(),
+            )
         }
         "rollback" => {
             let mut req: RollbackRequest =
@@ -125,10 +120,7 @@ pub(crate) fn json_to_message<T: Message + Default>(
     message_name: &str,
     body: &[u8],
 ) -> Result<T, Status> {
-    let descriptor = state
-        .pool
-        .get_message_by_name(message_name)
-        .expect("descriptor present");
+    let descriptor = state.pool.get_message_by_name(message_name).expect("descriptor present");
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let dynamic = DynamicMessage::deserialize_with_options(
         descriptor,
@@ -145,21 +137,20 @@ pub(crate) fn message_to_json<T: Message>(
     message_name: &str,
     message: &T,
 ) -> Result<String, Status> {
-    let descriptor = state
-        .pool
-        .get_message_by_name(message_name)
-        .expect("descriptor present");
+    let descriptor = state.pool.get_message_by_name(message_name).expect("descriptor present");
     let dynamic = DynamicMessage::decode(descriptor, message.encode_to_vec().as_slice())
         .map_err(|e| Status::internal(format!("transcode: {e}")))?;
     let mut out = Vec::new();
     let mut serializer = serde_json::Serializer::new(&mut out);
-    dynamic
-        .serialize(&mut serializer)
-        .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+    dynamic.serialize(&mut serializer).map_err(|e| Status::internal(format!("serialize: {e}")))?;
     String::from_utf8(out).map_err(|e| Status::internal(e.to_string()))
 }
 
-async fn collect_json<T, S>(state: &RestState, message_name: &str, mut stream: S) -> Result<String, Status>
+async fn collect_json<T, S>(
+    state: &RestState,
+    message_name: &str,
+    mut stream: S,
+) -> Result<String, Status>
 where
     T: Message,
     S: futures::Stream<Item = Result<T, Status>> + Unpin,
@@ -190,10 +181,8 @@ pub async fn set_security_rules(
             return status_response(&Status::invalid_argument(format!("invalid JSON: {e}")));
         }
     };
-    let source = parsed
-        .pointer("/rules/files/0/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let source =
+        parsed.pointer("/rules/files/0/content").and_then(|v| v.as_str()).unwrap_or_default();
     let ruleset = match waldflam_rules::parse(source) {
         Ok(r) => r,
         Err(issue) => {
@@ -257,12 +246,7 @@ pub(crate) fn status_response(status: &Status) -> Response {
             "status": name,
         }
     });
-    (
-        http,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    (http, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
 /// gRPC→HTTP status mapping (docs/architecture.md §11).
@@ -291,15 +275,9 @@ fn http_code(code: tonic::Code) -> (StatusCode, &'static str) {
 
 /// Permissive CORS, mirroring the emulator: echo the Origin, allow
 /// credentials, echo requested headers; preflights answer 200.
-pub async fn cors(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
+pub async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let origin = request.headers().get(header::ORIGIN).cloned();
-    let requested = request
-        .headers()
-        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-        .cloned();
+    let requested = request.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
     let mut response = if request.method() == Method::OPTIONS {
         (StatusCode::OK, "").into_response()
     } else {
@@ -312,10 +290,7 @@ pub async fn cors(
             header::ACCESS_CONTROL_ALLOW_METHODS,
             HeaderValue::from_static("DELETE,GET,HEAD,PATCH,POST,PUT,OPTIONS"),
         );
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-            HeaderValue::from_static("true"),
-        );
+        headers.insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         headers.insert(
             header::ACCESS_CONTROL_EXPOSE_HEADERS,
             HeaderValue::from_static("X-HTTP-Session-Id"),

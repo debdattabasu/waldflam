@@ -27,25 +27,15 @@ pub struct RulesRegistry {
 
 impl RulesRegistry {
     pub fn set(&self, database: &DatabaseName, ruleset: Ruleset) {
-        self.inner
-            .write()
-            .expect("rules lock")
-            .insert(database.to_string(), Arc::new(ruleset));
+        self.inner.write().expect("rules lock").insert(database.to_string(), Arc::new(ruleset));
     }
 
     pub fn get(&self, database: &DatabaseName) -> Option<Arc<Ruleset>> {
-        self.inner
-            .read()
-            .expect("rules lock")
-            .get(&database.to_string())
-            .cloned()
+        self.inner.read().expect("rules lock").get(&database.to_string()).cloned()
     }
 
     pub fn clear(&self, database: &DatabaseName) {
-        self.inner
-            .write()
-            .expect("rules lock")
-            .remove(&database.to_string());
+        self.inner.write().expect("rules lock").remove(&database.to_string());
     }
 }
 
@@ -76,8 +66,7 @@ impl<'a> StoreHost<'a> {
         // The engine is synchronous; block on the store from a blocking
         // context (rules evaluation runs inside spawn_blocking).
         let found = tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(self.store.get_document(self.database, &parsed))
+            self.handle.block_on(self.store.get_document(self.database, &parsed))
         })
         .map_err(|e| e.to_string())?;
         let value = found.map(|doc| document_value(&doc));
@@ -103,10 +92,7 @@ fn document_value(doc: &StoredDocument) -> Value {
     if let Some(id) = doc.path.last_id() {
         map.insert("id".into(), Value::str(id));
     }
-    map.insert(
-        "__name__".into(),
-        Value::Path(Arc::new(doc.path.segments().to_vec())),
-    );
+    map.insert("__name__".into(), Value::Path(Arc::new(doc.path.segments().to_vec())));
     Value::map(map)
 }
 
@@ -128,12 +114,10 @@ fn proto_value(value: &PValue) -> Value {
         Some(ValueType::BytesValue(b)) => Value::Bytes(Arc::from(b.as_ref())),
         Some(ValueType::TimestampValue(ts)) => Value::Timestamp(ts.seconds, ts.nanos as u32),
         Some(ValueType::GeoPointValue(g)) => Value::LatLng(g.latitude, g.longitude),
-        Some(ValueType::ReferenceValue(r)) => Value::Path(Arc::new(
-            r.split('/').map(str::to_owned).collect(),
-        )),
-        Some(ValueType::ArrayValue(a)) => {
-            Value::list(a.values.iter().map(proto_value).collect())
+        Some(ValueType::ReferenceValue(r)) => {
+            Value::Path(Arc::new(r.split('/').map(str::to_owned).collect()))
         }
+        Some(ValueType::ArrayValue(a)) => Value::list(a.values.iter().map(proto_value).collect()),
         Some(ValueType::MapValue(m)) => {
             let mut out = BTreeMap::new();
             for (k, v) in &m.fields {
@@ -176,14 +160,7 @@ pub async fn check(
     let auth_value = match auth {
         Authorization::User(claims) => {
             let mut map = BTreeMap::new();
-            map.insert(
-                "uid".into(),
-                claims
-                    .uid
-                    .as_deref()
-                    .map(Value::str)
-                    .unwrap_or(Value::Null),
-            );
+            map.insert("uid".into(), claims.uid.as_deref().map(Value::str).unwrap_or(Value::Null));
             let mut token = BTreeMap::new();
             for (k, v) in &claims.payload {
                 token.insert(k.clone(), json_value(v));
@@ -251,9 +228,7 @@ pub async fn check(
 
     match decision {
         Decision::Allow => Ok(()),
-        Decision::Deny => Err(Status::permission_denied(
-            "Missing or insufficient permissions.",
-        )),
+        Decision::Deny => Err(Status::permission_denied("Missing or insufficient permissions.")),
     }
 }
 
@@ -287,11 +262,8 @@ pub async fn check_writes(
             .get_document(database, &parsed.path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let operation = hint.unwrap_or(if existing.is_some() {
-            Operation::Update
-        } else {
-            Operation::Create
-        });
+        let operation =
+            hint.unwrap_or(if existing.is_some() { Operation::Update } else { Operation::Create });
         check(
             registry,
             store,

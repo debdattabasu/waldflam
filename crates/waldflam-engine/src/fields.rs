@@ -30,9 +30,7 @@ pub fn set_field(fields: &mut HashMap<String, Value>, path: &str, value: Value) 
     let (last, parents) = segments.split_last().expect("non-empty path");
     let mut current = fields;
     for seg in parents {
-        let entry = current
-            .entry((*seg).to_owned())
-            .or_insert_with(|| map_value(HashMap::new()));
+        let entry = current.entry((*seg).to_owned()).or_insert_with(|| map_value(HashMap::new()));
         if !matches!(entry.value_type, Some(ValueType::MapValue(_))) {
             *entry = map_value(HashMap::new());
         }
@@ -78,9 +76,12 @@ mod tests {
         assert_eq!(get_field(&fields, "a.b.c"), Some(&int(1)));
         assert_eq!(get_field(&fields, "a.b.d"), Some(&int(2)));
         assert_eq!(get_field(&fields, "top"), Some(&int(3)));
-        assert_eq!(get_field(&fields, "a.b"), Some(&map_value(
-            [("c".to_owned(), int(1)), ("d".to_owned(), int(2))].into_iter().collect(),
-        )));
+        assert_eq!(
+            get_field(&fields, "a.b"),
+            Some(&map_value(
+                [("c".to_owned(), int(1)), ("d".to_owned(), int(2))].into_iter().collect(),
+            ))
+        );
         assert_eq!(get_field(&fields, "a.missing"), None);
         assert_eq!(get_field(&fields, "top.not_a_map"), None);
 

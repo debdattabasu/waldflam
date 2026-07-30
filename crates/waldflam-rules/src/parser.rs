@@ -16,9 +16,11 @@ const MAX_EXPR_DEPTH: u32 = 100;
 const MAX_MATCH_DEPTH: u32 = 10;
 
 pub fn parse(source: &str) -> Result<Ruleset, Issue> {
-    let tokens = Lexer::new(source)
-        .tokenize()
-        .map_err(|e| Issue { message: e.message, line: e.line, col: e.col })?;
+    let tokens = Lexer::new(source).tokenize().map_err(|e| Issue {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
     let mut parser = Parser { source, tokens, pos: 0, depth: 0 };
     parser.ruleset()
 }
@@ -151,24 +153,25 @@ impl<'a> Parser<'a> {
         let mut segments = Vec::new();
         let mut glob_seen = false;
         for (i, seg) in raw.iter().enumerate() {
-            let parsed = if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                if let Some(name) = inner.strip_suffix("=**") {
-                    if glob_seen {
-                        return Err(self.err("only one recursive wildcard is permitted"));
-                    }
-                    glob_seen = true;
-                    if version == Version::V1 && i != raw.len() - 1 {
-                        return Err(self.err(
+            let parsed =
+                if let Some(inner) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    if let Some(name) = inner.strip_suffix("=**") {
+                        if glob_seen {
+                            return Err(self.err("only one recursive wildcard is permitted"));
+                        }
+                        glob_seen = true;
+                        if version == Version::V1 && i != raw.len() - 1 {
+                            return Err(self.err(
                             "recursive wildcards must be the last path segment in rules_version 1",
                         ));
+                        }
+                        MatchSeg::Glob(name.to_owned())
+                    } else {
+                        MatchSeg::Capture(inner.to_owned())
                     }
-                    MatchSeg::Glob(name.to_owned())
                 } else {
-                    MatchSeg::Capture(inner.to_owned())
-                }
-            } else {
-                MatchSeg::Literal(seg.clone())
-            };
+                    MatchSeg::Literal(seg.clone())
+                };
             segments.push(parsed);
         }
         if segments.is_empty() {
@@ -513,9 +516,11 @@ impl<'a> Parser<'a> {
 
 /// Parses a standalone expression (used for `$(…)` path splices).
 pub fn parse_expression(source: &str) -> Result<Expr, Issue> {
-    let tokens = Lexer::new(source)
-        .tokenize()
-        .map_err(|e| Issue { message: e.message, line: e.line, col: e.col })?;
+    let tokens = Lexer::new(source).tokenize().map_err(|e| Issue {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
     let mut parser = Parser { source, tokens, pos: 0, depth: 0 };
     let expr = parser.expr(0)?;
     if parser.cur().tok != Tok::Eof {

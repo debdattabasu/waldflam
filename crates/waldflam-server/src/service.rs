@@ -21,12 +21,7 @@ pub struct FirestoreService {
 
 impl FirestoreService {
     pub fn new(store: Store) -> Self {
-        Self {
-            store,
-            txns: Default::default(),
-            hub: Default::default(),
-            rules: Default::default(),
-        }
+        Self { store, txns: Default::default(), hub: Default::default(), rules: Default::default() }
     }
 
     /// Rules enforcement for one document access.
@@ -43,13 +38,7 @@ impl FirestoreService {
             &self.rules,
             &self.store,
             auth,
-            crate::rules::AccessRequest {
-                database,
-                path,
-                operation,
-                incoming,
-                existing,
-            },
+            crate::rules::AccessRequest { database, path, operation, incoming, existing },
         )
         .await
     }
@@ -151,11 +140,7 @@ fn project_fields(
     fields: std::collections::HashMap<String, Value>,
     projection: &structured_query::Projection,
 ) -> std::collections::HashMap<String, Value> {
-    let paths: Vec<&str> = projection
-        .fields
-        .iter()
-        .map(|f| f.field_path.as_str())
-        .collect();
+    let paths: Vec<&str> = projection.fields.iter().map(|f| f.field_path.as_str()).collect();
     if paths.is_empty() {
         return fields;
     }
@@ -227,11 +212,8 @@ impl Firestore for FirestoreService {
             Err(e) => return Err(Status::invalid_argument(e.to_string())),
         };
         // TODO(consistency): honor read_time (reads see latest state).
-        let doc = self
-            .store
-            .get_document(&name.database, &name.path)
-            .await
-            .map_err(engine_status)?;
+        let doc =
+            self.store.get_document(&name.database, &name.path).await.map_err(engine_status)?;
         if let Some(get_document_request::ConsistencySelector::Transaction(token)) =
             req.consistency_selector.as_ref()
         {
@@ -306,10 +288,8 @@ impl Firestore for FirestoreService {
         let documents = docs
             .into_iter()
             .map(|doc| {
-                let name = ResourceName {
-                    database: parent.database.clone(),
-                    path: doc.path.clone(),
-                };
+                let name =
+                    ResourceName { database: parent.database.clone(), path: doc.path.clone() };
                 let mut wire = to_wire_document(&name, doc);
                 if let Some(mask) = req.mask.as_ref() {
                     wire.fields = mask_fields(wire.fields, mask);
@@ -317,10 +297,7 @@ impl Firestore for FirestoreService {
                 wire
             })
             .collect();
-        Ok(Response::new(ListDocumentsResponse {
-            documents,
-            next_page_token: String::new(),
-        }))
+        Ok(Response::new(ListDocumentsResponse { documents, next_page_token: String::new() }))
     }
 
     async fn update_document(
@@ -389,11 +366,8 @@ impl Firestore for FirestoreService {
             }
             let parsed = ResourceName::parse_document(name)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let doc = self
-                .store
-                .get_document(&database, &parsed.path)
-                .await
-                .map_err(engine_status)?;
+            let doc =
+                self.store.get_document(&database, &parsed.path).await.map_err(engine_status)?;
             if let Some(token) = txn_token.as_ref() {
                 let version = doc.as_ref().map(|d| d.update_time_us).unwrap_or(0);
                 self.txns.record_read(token, parsed.path.to_string(), version);
@@ -410,9 +384,9 @@ impl Firestore for FirestoreService {
                 .await?;
             }
             let result = match doc {
-                Some(doc) => batch_get_documents_response::Result::Found(
-                    to_wire_document(&parsed, doc),
-                ),
+                Some(doc) => {
+                    batch_get_documents_response::Result::Found(to_wire_document(&parsed, doc))
+                }
                 None => batch_get_documents_response::Result::Missing(name.clone()),
             };
             responses.push(Ok(BatchGetDocumentsResponse {
@@ -450,21 +424,15 @@ impl Firestore for FirestoreService {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let now = now_us();
 
-        crate::rules::check_writes(&self.rules, &self.store, &auth, &database, &req.writes)
-            .await?;
+        crate::rules::check_writes(&self.rules, &self.store, &auth, &database, &req.writes).await?;
 
         // The commit lock serializes validate+apply across all commits so a
         // transaction can't be invalidated between its validation and write.
         let _commit_guard = self.txns.commit_lock.lock().await;
         if !req.transaction.is_empty() {
-            let state = self
-                .txns
-                .take(&req.transaction, &database)
-                .map_err(engine_status)?;
+            let state = self.txns.take(&req.transaction, &database).map_err(engine_status)?;
             if state.read_only && !req.writes.is_empty() {
-                return Err(Status::invalid_argument(
-                    "read-only transaction cannot write",
-                ));
+                return Err(Status::invalid_argument("read-only transaction cannot write"));
             }
             waldflam_engine::txn::validate_read_set(&self.store, &state)
                 .await
@@ -492,10 +460,7 @@ impl Firestore for FirestoreService {
         }))
     }
 
-    async fn rollback(
-        &self,
-        request: Request<RollbackRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<()>, Status> {
         // Rollback is best-effort and idempotent (clients fire-and-forget it
         // on detached contexts): unknown ids are fine.
         self.txns.rollback(&request.into_inner().transaction);
@@ -543,8 +508,7 @@ impl Firestore for FirestoreService {
                 .map_err(engine_status)?;
         if let Some(token) = txn_token.as_ref() {
             for doc in &docs {
-                self.txns
-                    .record_read(token, doc.path.to_string(), doc.update_time_us);
+                self.txns.record_read(token, doc.path.to_string(), doc.update_time_us);
             }
         }
 
@@ -554,7 +518,8 @@ impl Firestore for FirestoreService {
             .into_iter()
             .enumerate()
             .map(|(i, doc)| {
-                let name = ResourceName { database: parent.database.clone(), path: doc.path.clone() };
+                let name =
+                    ResourceName { database: parent.database.clone(), path: doc.path.clone() };
                 let mut wire = to_wire_document(&name, doc);
                 if let Some(projection) = select {
                     wire.fields = project_fields(wire.fields, projection);
@@ -610,9 +575,7 @@ impl Firestore for FirestoreService {
         // One response carrying every aggregate satisfies all SDK contracts
         // (JS asserts exactly one result; Go merges across responses).
         let response = RunAggregationQueryResponse {
-            result: Some(AggregationResult {
-                aggregate_fields: results.into_iter().collect(),
-            }),
+            result: Some(AggregationResult { aggregate_fields: results.into_iter().collect() }),
             read_time: Some(timestamp_from_us(now_us())),
             ..Default::default()
         };
@@ -689,5 +652,4 @@ impl Firestore for FirestoreService {
     ) -> Result<Response<BatchWriteResponse>, Status> {
         Err(Status::unimplemented("BatchWrite"))
     }
-
 }

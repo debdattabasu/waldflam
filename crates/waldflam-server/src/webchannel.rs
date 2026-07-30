@@ -136,9 +136,7 @@ pub async fn intercept(
         return next.run(request).await;
     };
     let raw_query = request.uri().query().map(str::to_owned);
-    let body = axum::body::to_bytes(request.into_body(), 1 << 22)
-        .await
-        .unwrap_or_default();
+    let body = axum::body::to_bytes(request.into_body(), 1 << 22).await.unwrap_or_default();
     handle(state, rpc, raw_query, body).await
 }
 
@@ -164,12 +162,7 @@ async fn handle(state: RestState, rpc: String, raw_query: Option<String>, body: 
 }
 
 fn framed_response(body: String) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        body,
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 fn unknown_sid() -> Response {
@@ -181,17 +174,14 @@ fn unknown_sid() -> Response {
 /// Extracts credentials from the handshake body's `headers=` block:
 /// an HTTP/1.1-style CRLF-separated header list, URL-encoded whole.
 fn auth_from_body(body: &[u8]) -> crate::auth::Authorization {
-    let fields: HashMap<String, String> = form_urlencoded::parse(body)
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    let fields: HashMap<String, String> =
+        form_urlencoded::parse(body).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     let Some(block) = fields.get("headers") else {
         return crate::auth::Authorization::Unauthenticated;
     };
     let header = block.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("authorization")
-            .then(|| value.trim().to_owned())
+        name.trim().eq_ignore_ascii_case("authorization").then(|| value.trim().to_owned())
     });
     crate::auth::Authorization::from_header(header.as_deref())
         .unwrap_or(crate::auth::Authorization::Unauthenticated)
@@ -200,29 +190,33 @@ fn auth_from_body(body: &[u8]) -> crate::auth::Authorization {
 /// Decodes the `count`/`ofs`/`req{i}___data__` form body into raw JSON
 /// message strings, in order.
 fn decode_forward_body(body: &[u8]) -> Vec<String> {
-    let fields: HashMap<String, String> = form_urlencoded::parse(body)
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    let count: usize = fields
-        .get("count")
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-    (0..count)
-        .filter_map(|i| fields.get(&format!("req{i}___data__")).cloned())
-        .collect()
+    let fields: HashMap<String, String> =
+        form_urlencoded::parse(body).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let count: usize = fields.get("count").and_then(|c| c.parse().ok()).unwrap_or(0);
+    (0..count).filter_map(|i| fields.get(&format!("req{i}___data__")).cloned()).collect()
 }
 
-async fn deliver(state: &RestState, session: &Session, messages: Vec<String>) -> Result<(), Status> {
+async fn deliver(
+    state: &RestState,
+    session: &Session,
+    messages: Vec<String>,
+) -> Result<(), Status> {
     for json in messages {
         match &session.forward {
             ForwardSender::Listen(tx) => {
-                let req: ListenRequest =
-                    crate::rest::json_to_message(state, "google.firestore.v1.ListenRequest", json.as_bytes())?;
+                let req: ListenRequest = crate::rest::json_to_message(
+                    state,
+                    "google.firestore.v1.ListenRequest",
+                    json.as_bytes(),
+                )?;
                 tx.send(Ok(req)).await.map_err(|_| Status::cancelled("stream ended"))?;
             }
             ForwardSender::Write(tx) => {
-                let req: WriteRequest =
-                    crate::rest::json_to_message(state, "google.firestore.v1.WriteRequest", json.as_bytes())?;
+                let req: WriteRequest = crate::rest::json_to_message(
+                    state,
+                    "google.firestore.v1.WriteRequest",
+                    json.as_bytes(),
+                )?;
                 tx.send(Ok(req)).await.map_err(|_| Status::cancelled("stream ended"))?;
             }
         }
@@ -245,44 +239,39 @@ async fn handshake(
 
     // Spawn the underlying RPC with an mpsc-fed request stream and pump its
     // responses into the session's array buffer as JSON.
-    let (session, mut responses): (Arc<Session>, mpsc::Receiver<Result<String, Status>>) =
-        match rpc {
-            "Listen" => {
-                let (tx, rx) = mpsc::channel(64);
-                let stream = crate::listen::spawn(
-                    state.svc.store_handle(),
-                    state.svc.hub_handle(),
-                    auth.clone(),
-                    state.svc.rules.clone(),
-                    ReceiverStream::new(rx),
-                );
-                let (jtx, jrx) = mpsc::channel(64);
-                pump_json(state.clone(), "google.firestore.v1.ListenResponse", stream, jtx);
-                (make_session(ForwardSender::Listen(tx)), jrx)
-            }
-            "Write" => {
-                let (tx, rx) = mpsc::channel(64);
-                let stream = crate::write_stream::spawn(
-                    state.svc.store_handle(),
-                    state.svc.hub_handle(),
-                    state.svc.txns_handle(),
-                    auth.clone(),
-                    state.svc.rules.clone(),
-                    ReceiverStream::new(rx),
-                );
-                let (jtx, jrx) = mpsc::channel(64);
-                pump_json(state.clone(), "google.firestore.v1.WriteResponse", stream, jtx);
-                (make_session(ForwardSender::Write(tx)), jrx)
-            }
-            _ => return (StatusCode::NOT_FOUND, "unknown rpc").into_response(),
-        };
+    let (session, mut responses): (Arc<Session>, mpsc::Receiver<Result<String, Status>>) = match rpc
+    {
+        "Listen" => {
+            let (tx, rx) = mpsc::channel(64);
+            let stream = crate::listen::spawn(
+                state.svc.store_handle(),
+                state.svc.hub_handle(),
+                auth.clone(),
+                state.svc.rules.clone(),
+                ReceiverStream::new(rx),
+            );
+            let (jtx, jrx) = mpsc::channel(64);
+            pump_json(state.clone(), "google.firestore.v1.ListenResponse", stream, jtx);
+            (make_session(ForwardSender::Listen(tx)), jrx)
+        }
+        "Write" => {
+            let (tx, rx) = mpsc::channel(64);
+            let stream = crate::write_stream::spawn(
+                state.svc.store_handle(),
+                state.svc.hub_handle(),
+                state.svc.txns_handle(),
+                auth.clone(),
+                state.svc.rules.clone(),
+                ReceiverStream::new(rx),
+            );
+            let (jtx, jrx) = mpsc::channel(64);
+            pump_json(state.clone(), "google.firestore.v1.WriteResponse", stream, jtx);
+            (make_session(ForwardSender::Write(tx)), jrx)
+        }
+        _ => return (StatusCode::NOT_FOUND, "unknown rpc").into_response(),
+    };
 
-    state
-        .sessions
-        .sessions
-        .lock()
-        .expect("sessions lock")
-        .insert(sid.clone(), session.clone());
+    state.sessions.sessions.lock().expect("sessions lock").insert(sid.clone(), session.clone());
 
     // Buffer-filler task: RPC responses (and terminal errors, delivered
     // in-band as {"error": …}) become data arrays.
@@ -365,13 +354,7 @@ async fn forward_post(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Response {
-    let Some(session) = state
-        .sessions
-        .sessions
-        .lock()
-        .expect("sessions lock")
-        .get(&sid)
-        .cloned()
+    let Some(session) = state.sessions.sessions.lock().expect("sessions lock").get(&sid).cloned()
     else {
         return unknown_sid();
     };
@@ -381,12 +364,7 @@ async fn forward_post(
 
     // Dedupe retransmissions by RID.
     let is_new = match params.get("RID") {
-        Some(rid) => session
-            .inner
-            .lock()
-            .expect("session lock")
-            .seen_rids
-            .insert(rid.clone()),
+        Some(rid) => session.inner.lock().expect("session lock").seen_rids.insert(rid.clone()),
         None => true,
     };
     if is_new {
@@ -396,26 +374,14 @@ async fn forward_post(
         }
     }
 
-    let last = session
-        .inner
-        .lock()
-        .expect("session lock")
-        .last_data_array_id;
+    let last = session.inner.lock().expect("session lock").last_data_array_id;
     framed_response(frame(&format!("[1,{last},0]")))
 }
 
 async fn backchannel(state: RestState, params: HashMap<String, String>) -> Response {
     let Some(session) = params
         .get("SID")
-        .and_then(|sid| {
-            state
-                .sessions
-                .sessions
-                .lock()
-                .expect("sessions lock")
-                .get(sid)
-                .cloned()
-        })
+        .and_then(|sid| state.sessions.sessions.lock().expect("sessions lock").get(sid).cloned())
     else {
         return unknown_sid();
     };
@@ -423,10 +389,7 @@ async fn backchannel(state: RestState, params: HashMap<String, String>) -> Respo
         session.ack(aid);
     }
     let long_polling = params.get("CI").map(String::as_str) == Some("1");
-    let hold_ms: u64 = params
-        .get("TO")
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(30_000);
+    let hold_ms: u64 = params.get("TO").and_then(|t| t.parse().ok()).unwrap_or(30_000);
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(32);
     tokio::spawn(async move {
@@ -445,12 +408,7 @@ async fn backchannel(state: RestState, params: HashMap<String, String>) -> Respo
                 if inner.terminated {
                     return;
                 }
-                inner
-                    .arrays
-                    .iter()
-                    .filter(|(id, _)| *id > cursor)
-                    .cloned()
-                    .collect()
+                inner.arrays.iter().filter(|(id, _)| *id > cursor).cloned().collect()
             };
             if !pending.is_empty() {
                 let mut out = String::new();

@@ -35,9 +35,7 @@ pub struct JwtClaims {
 impl Authorization {
     /// Extracts credentials from gRPC request metadata.
     pub fn from_metadata(metadata: &tonic::metadata::MetadataMap) -> Result<Self, Status> {
-        let header = metadata
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
+        let header = metadata.get("authorization").and_then(|v| v.to_str().ok());
         Self::from_header(header)
     }
 
@@ -78,19 +76,15 @@ fn parse_unsigned_jwt(token: &str) -> Result<JwtClaims, &'static str> {
     }
 
     let payload: serde_json::Map<String, serde_json::Value> = decode_json_segment(payload)?;
-    let uid = payload
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
+    let uid = payload.get("sub").and_then(|v| v.as_str()).map(str::to_owned);
     Ok(JwtClaims { uid, payload })
 }
 
 fn decode_json_segment(
     segment: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, &'static str> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(segment.trim_end_matches('='))
-        .map_err(|_| "invalid base64url")?;
+    let bytes =
+        URL_SAFE_NO_PAD.decode(segment.trim_end_matches('=')).map_err(|_| "invalid base64url")?;
     match serde_json::from_slice(&bytes) {
         Ok(serde_json::Value::Object(map)) => Ok(map),
         _ => Err("segment is not a JSON object"),
@@ -103,29 +97,18 @@ mod tests {
 
     fn unsigned_jwt(payload: serde_json::Value) -> String {
         let enc = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
-        format!(
-            "{}.{}.",
-            enc(&serde_json::json!({"alg": "none", "typ": "JWT"})),
-            enc(&payload)
-        )
+        format!("{}.{}.", enc(&serde_json::json!({"alg": "none", "typ": "JWT"})), enc(&payload))
     }
 
     #[test]
     fn absent_header_is_unauthenticated() {
-        assert_eq!(
-            Authorization::from_header(None).unwrap(),
-            Authorization::Unauthenticated
-        );
+        assert_eq!(Authorization::from_header(None).unwrap(), Authorization::Unauthenticated);
     }
 
     #[test]
     fn owner_is_admin_case_insensitively() {
         for h in ["Bearer owner", "bearer owner", "Bearer OWNER", "BEARER Owner"] {
-            assert_eq!(
-                Authorization::from_header(Some(h)).unwrap(),
-                Authorization::Admin,
-                "{h}"
-            );
+            assert_eq!(Authorization::from_header(Some(h)).unwrap(), Authorization::Admin, "{h}");
         }
     }
 
@@ -141,10 +124,7 @@ mod tests {
             panic!("expected user auth");
         };
         assert_eq!(claims.uid.as_deref(), Some("alice"));
-        assert_eq!(
-            claims.payload["email"],
-            serde_json::json!("alice@example.com")
-        );
+        assert_eq!(claims.payload["email"], serde_json::json!("alice@example.com"));
     }
 
     #[test]
@@ -161,10 +141,10 @@ mod tests {
     #[test]
     fn rejects_malformed_tokens() {
         for h in [
-            "Basic abc",                        // wrong scheme
-            "Bearer not.a",                     // two segments
-            "Bearer a.b.c.d",                   // four segments
-            "Bearer !!.!!.",                    // bad base64
+            "Basic abc",      // wrong scheme
+            "Bearer not.a",   // two segments
+            "Bearer a.b.c.d", // four segments
+            "Bearer !!.!!.",  // bad base64
         ] {
             assert!(Authorization::from_header(Some(h)).is_err(), "{h}");
         }

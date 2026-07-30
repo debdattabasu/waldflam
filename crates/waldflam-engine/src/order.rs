@@ -80,7 +80,9 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Some(ValueType::BooleanValue(x)), Some(ValueType::BooleanValue(y))) => x.cmp(y),
         (Some(ValueType::IntegerValue(x)), Some(ValueType::IntegerValue(y))) => x.cmp(y),
         (Some(ValueType::DoubleValue(x)), Some(ValueType::DoubleValue(y))) => cmp_doubles(*x, *y),
-        (Some(ValueType::IntegerValue(x)), Some(ValueType::DoubleValue(y))) => cmp_int_double(*x, *y),
+        (Some(ValueType::IntegerValue(x)), Some(ValueType::DoubleValue(y))) => {
+            cmp_int_double(*x, *y)
+        }
         (Some(ValueType::DoubleValue(x)), Some(ValueType::IntegerValue(y))) => {
             cmp_int_double(*y, *x).reverse()
         }
@@ -212,10 +214,7 @@ mod tests {
     }
     fn ts(seconds: i64, nanos: i32) -> Value {
         Value {
-            value_type: Some(ValueType::TimestampValue(prost_types::Timestamp {
-                seconds,
-                nanos,
-            })),
+            value_type: Some(ValueType::TimestampValue(prost_types::Timestamp { seconds, nanos })),
         }
     }
     fn string(s: &str) -> Value {
@@ -229,10 +228,7 @@ mod tests {
     }
     fn geo(lat: f64, lng: f64) -> Value {
         Value {
-            value_type: Some(ValueType::GeoPointValue(LatLng {
-                latitude: lat,
-                longitude: lng,
-            })),
+            value_type: Some(ValueType::GeoPointValue(LatLng { latitude: lat, longitude: lng })),
         }
     }
     fn array(vs: Vec<Value>) -> Value {
@@ -333,7 +329,10 @@ mod tests {
         // agree here, but ':' or '!' suffixed ids would flip it). Verify the
         // segment rule directly.
         assert_eq!(
-            cmp_references("projects/p/databases/d/documents/c/d!", "projects/p/databases/d/documents/c/d/x/y"),
+            cmp_references(
+                "projects/p/databases/d/documents/c/d!",
+                "projects/p/databases/d/documents/c/d/x/y"
+            ),
             Ordering::Greater // "d!" > "d" segment-wise even though '!' < '/'
         );
     }

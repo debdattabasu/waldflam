@@ -62,12 +62,11 @@ pub async fn apply_commit(
     for write in writes {
         let path = write_target(database, write)?;
         let key = path.to_string();
-        if !states.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = states.entry(key) {
             let loaded = store.get_document(database, &path).await?;
-            let current = loaded
-                .as_ref()
-                .map(|d| (d.create_time_us, d.update_time_us, d.fields.clone()));
-            states.insert(key, DocState { current, before: loaded, dirty: false });
+            let current =
+                loaded.as_ref().map(|d| (d.create_time_us, d.update_time_us, d.fields.clone()));
+            e.insert(DocState { current, before: loaded, dirty: false });
         }
     }
 
@@ -93,11 +92,7 @@ pub async fn apply_commit(
         match &state.current {
             Some((_, _, fields)) => {
                 let stored = store.set_document(database, &path, fields.clone(), now_us).await?;
-                changes.push(crate::watch::DocumentDelta {
-                    path,
-                    before,
-                    after: Some(stored),
-                });
+                changes.push(crate::watch::DocumentDelta { path, before, after: Some(stored) });
             }
             None => {
                 store.delete_document(database, &path).await?;
@@ -113,7 +108,9 @@ fn write_target(database: &DatabaseName, write: &Write) -> Result<ResourcePath, 
         Some(Operation::Update(doc)) => &doc.name,
         Some(Operation::Delete(name)) | Some(Operation::Verify(name)) => name,
         Some(Operation::Transform(t)) => &t.document,
-        None => return Err(EngineError::InvalidArgument("write has no operation".into())),
+        None => {
+            return Err(EngineError::InvalidArgument("write has no operation".into()));
+        }
     };
     let parsed = ResourceName::parse_document(name)?;
     if parsed.database != *database {
@@ -293,8 +290,7 @@ fn increment(current: Option<&Value>, operand: &Value) -> Result<Value, EngineEr
     Ok(match (cur, op) {
         (Number::Int(a), Number::Int(b)) => int_value(
             // Saturating: positive overflow pins to MAX, negative to MIN.
-            a.checked_add(b)
-                .unwrap_or(if b >= 0 { i64::MAX } else { i64::MIN }),
+            a.checked_add(b).unwrap_or(if b >= 0 { i64::MAX } else { i64::MIN }),
         ),
         (Number::Int(a), Number::Double(b)) => double_value(a as f64 + b),
         (Number::Double(a), Number::Int(b)) => double_value(a + b as f64),
@@ -322,11 +318,7 @@ fn max_min(current: Option<&Value>, operand: &Value, want_max: bool) -> Result<V
         return Ok(cur.clone());
     }
     let ordering = compare_values(cur, operand);
-    let keep_current = if want_max {
-        ordering.is_ge()
-    } else {
-        ordering.is_le()
-    };
+    let keep_current = if want_max { ordering.is_ge() } else { ordering.is_le() };
     Ok(if keep_current { cur.clone() } else { operand.clone() })
 }
 
@@ -368,10 +360,7 @@ mod tests {
         assert_eq!(increment(Some(&cur), &int_value(-10)).unwrap(), int_value(i64::MIN));
         assert_eq!(increment(Some(&int_value(1)), &double_value(0.5)).unwrap(), double_value(1.5));
         assert_eq!(increment(None, &int_value(7)).unwrap(), int_value(7));
-        assert_eq!(
-            increment(Some(&null_value()), &int_value(7)).unwrap(),
-            int_value(7)
-        );
+        assert_eq!(increment(Some(&null_value()), &int_value(7)).unwrap(), int_value(7));
         assert!(increment(Some(&int_value(1)), &null_value()).is_err());
     }
 
@@ -396,11 +385,8 @@ mod tests {
     #[test]
     fn array_transforms_dedup_by_index_equality() {
         let cur = array_value(vec![int_value(1), int_value(2)]);
-        let mut state = DocState {
-            current: Some((0, 0, HashMap::new())),
-            before: None,
-            dirty: false,
-        };
+        let mut state =
+            DocState { current: Some((0, 0, HashMap::new())), before: None, dirty: false };
         state.current.as_mut().unwrap().2.insert("a".into(), cur);
 
         // 1.0 collides with existing 1; 3 appends.
@@ -426,9 +412,6 @@ mod tests {
         };
         apply_transform(&mut state, &t, 0).unwrap();
         let (_, _, fields) = state.current.as_ref().unwrap();
-        assert_eq!(
-            get_field(fields, "a").unwrap(),
-            &array_value(vec![int_value(1), int_value(3)])
-        );
+        assert_eq!(get_field(fields, "a").unwrap(), &array_value(vec![int_value(1), int_value(3)]));
     }
 }

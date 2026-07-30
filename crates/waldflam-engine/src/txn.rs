@@ -135,9 +135,6 @@ mod tests {
         // Wrong database.
         let token = mgr.begin(&db, false);
         let other = DatabaseName::new("other", "(default)");
-        assert!(matches!(
-            mgr.take(&token, &other),
-            Err(EngineError::InvalidArgument(_))
-        ));
+        assert!(matches!(mgr.take(&token, &other), Err(EngineError::InvalidArgument(_))));
     }
 }

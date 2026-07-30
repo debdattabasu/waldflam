@@ -73,8 +73,7 @@ impl Store {
     }
 
     fn collection(&self, database: &DatabaseName) -> Collection<DocRow> {
-        self.db
-            .collection(&format!("{}~{}", database.project_id, database.database_id))
+        self.db.collection(&format!("{}~{}", database.project_id, database.database_id))
     }
 
     pub async fn get_document(
@@ -82,10 +81,7 @@ impl Store {
         database: &DatabaseName,
         path: &ResourcePath,
     ) -> Result<Option<StoredDocument>, EngineError> {
-        let row = self
-            .collection(database)
-            .find_one(doc! { "_id": path.to_string() })
-            .await?;
+        let row = self.collection(database).find_one(doc! { "_id": path.to_string() }).await?;
         row.map(decode_row).transpose()
     }
 
@@ -100,11 +96,7 @@ impl Store {
         now_us: i64,
     ) -> Result<StoredDocument, EngineError> {
         assert!(path.is_document(), "not a document path: {path}");
-        let payload = Document {
-            fields: fields.clone(),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        let payload = Document { fields: fields.clone(), ..Default::default() }.encode_to_vec();
         let indexed = index_entries(database, path, &fields);
         let collection_path = path.parent().expect("document has a parent");
 
@@ -151,9 +143,7 @@ impl Store {
         collection_id: &str,
     ) -> Result<Vec<StoredDocument>, EngineError> {
         self.collect_rows(
-            self.collection(database)
-                .find(doc! { "collection_id": collection_id })
-                .await?,
+            self.collection(database).find(doc! { "collection_id": collection_id }).await?,
         )
         .await
     }
@@ -165,15 +155,8 @@ impl Store {
         database: &DatabaseName,
         parent: &ResourcePath,
     ) -> Result<Vec<String>, EngineError> {
-        let paths = self
-            .collection(database)
-            .distinct("collection_path", doc! {})
-            .await?;
-        let prefix = if parent.is_empty() {
-            String::new()
-        } else {
-            format!("{parent}/")
-        };
+        let paths = self.collection(database).distinct("collection_path", doc! {}).await?;
+        let prefix = if parent.is_empty() { String::new() } else { format!("{parent}/") };
         let mut ids: Vec<String> = paths
             .into_iter()
             .filter_map(|p| p.as_str().map(str::to_owned))
@@ -211,10 +194,7 @@ impl Store {
         database: &DatabaseName,
         path: &ResourcePath,
     ) -> Result<bool, EngineError> {
-        let result = self
-            .collection(database)
-            .delete_one(doc! { "_id": path.to_string() })
-            .await?;
+        let result = self.collection(database).delete_one(doc! { "_id": path.to_string() }).await?;
         Ok(result.deleted_count > 0)
     }
 }
@@ -242,11 +222,8 @@ fn index_entries(
             path
         ))),
     };
-    let mut out = vec![IndexEntry {
-        p: "__name__".into(),
-        k: "v",
-        v: to_index_string(&encode_value(&name)),
-    }];
+    let mut out =
+        vec![IndexEntry { p: "__name__".into(), k: "v", v: to_index_string(&encode_value(&name)) }];
     for (field, value) in fields {
         // TODO(field-paths): escape components needing backticks; plain
         // dotted join for now.
@@ -256,11 +233,7 @@ fn index_entries(
 }
 
 fn add_entries(out: &mut Vec<IndexEntry>, path: String, value: &Value) {
-    out.push(IndexEntry {
-        p: path.clone(),
-        k: "v",
-        v: to_index_string(&encode_value(value)),
-    });
+    out.push(IndexEntry { p: path.clone(), k: "v", v: to_index_string(&encode_value(value)) });
     match value.value_type.as_ref() {
         Some(ValueType::ArrayValue(a)) => {
             for element in &a.values {

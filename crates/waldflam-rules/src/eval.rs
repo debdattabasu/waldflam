@@ -26,16 +26,11 @@ pub trait Host {
     fn exists(&mut self, path: &[String], after: bool) -> Result<bool, String>;
 }
 
+#[derive(Default)]
 pub struct Budget {
     steps: u32,
     /// Backend lookups (20/request) and cache misses per entity (10).
     pub lookups: u32,
-}
-
-impl Default for Budget {
-    fn default() -> Self {
-        Self { steps: 0, lookups: 0 }
-    }
 }
 
 pub struct Evaluator<'a, H: Host> {
@@ -194,10 +189,9 @@ impl<'a, H: Host> Evaluator<'a, H> {
                         None => Value::undefined("integer overflow"),
                     },
                     (UnOp::Neg, Value::Float(f)) => Value::Float(-f),
-                    (_, other) => Value::undefined(format!(
-                        "operator not supported on {}",
-                        other.type_name()
-                    )),
+                    (_, other) => {
+                        Value::undefined(format!("operator not supported on {}", other.type_name()))
+                    }
                 }
             }
             Expr::Binary(BinOp::And, l, r) => self.logical(l, r, scope, false)?,
@@ -237,10 +231,10 @@ impl<'a, H: Host> Evaluator<'a, H> {
     fn logical(&mut self, l: &Expr, r: &Expr, scope: &Scope, is_or: bool) -> EvalResult {
         let lv = self.eval(l, scope)?;
         // Short circuit: true||_ , false&&_ — rhs never evaluated.
-        if let Some(b) = lv.as_bool() {
-            if b == is_or {
-                return Ok(Value::Bool(b));
-            }
+        if let Some(b) = lv.as_bool()
+            && b == is_or
+        {
+            return Ok(Value::Bool(b));
         }
         let rv = self.eval(r, scope)?;
         Ok(match (lv.as_bool(), rv.as_bool()) {
@@ -264,10 +258,7 @@ impl<'a, H: Host> Evaluator<'a, H> {
                 Some(v) => v.clone(),
                 None => Value::undefined(format!("property {field} is undefined")),
             },
-            _ => Value::undefined(format!(
-                "{} has no property {field}",
-                base.type_name()
-            )),
+            _ => Value::undefined(format!("{} has no property {field}", base.type_name())),
         }
     }
 
@@ -282,8 +273,10 @@ impl<'a, H: Host> Evaluator<'a, H> {
         // on a variable — dispatch them before evaluating a "receiver".
         let namespaced = match target {
             Some(Expr::Ident(ns))
-                if matches!(ns.as_str(), "math" | "duration" | "latlng" | "timestamp" | "hashing")
-                    && scope.lookup(ns).is_none() =>
+                if matches!(
+                    ns.as_str(),
+                    "math" | "duration" | "latlng" | "timestamp" | "hashing"
+                ) && scope.lookup(ns).is_none() =>
             {
                 Some(format!("{ns}.{name}"))
             }
@@ -405,11 +398,9 @@ fn binary(op: BinOp, l: &Value, r: &Value) -> Value {
                 Gt => ord.is_gt(),
                 _ => ord.is_ge(),
             }),
-            None => Value::undefined(format!(
-                "cannot compare {} with {}",
-                l.type_name(),
-                r.type_name()
-            )),
+            None => {
+                Value::undefined(format!("cannot compare {} with {}", l.type_name(), r.type_name()))
+            }
         },
         In => match r {
             Value::List(items) => Value::Bool(items.iter().any(|i| i.equals(l))),
@@ -445,7 +436,10 @@ fn arithmetic(op: BinOp, l: &Value, r: &Value) -> Value {
     if op == Sub {
         if let (Value::Timestamp(s1, n1), Value::Timestamp(s2, n2)) = (l, r) {
             let total = (*s1 - *s2) * 1_000_000_000 + (*n1 as i64 - *n2 as i64);
-            return Value::Duration(total.div_euclid(1_000_000_000), total.rem_euclid(1_000_000_000) as u32);
+            return Value::Duration(
+                total.div_euclid(1_000_000_000),
+                total.rem_euclid(1_000_000_000) as u32,
+            );
         }
         if let (Value::Timestamp(s, n), Value::Duration(ds, dn)) = (l, r) {
             return add_timestamp(*s, *n, -*ds, 0).plus_nanos(-(*dn as i64));
@@ -519,10 +513,7 @@ impl Value {
 
 fn add_timestamp(s: i64, n: u32, ds: i64, dn: u32) -> Value {
     let total = (s + ds) * 1_000_000_000 + n as i64 + dn as i64;
-    Value::Timestamp(
-        total.div_euclid(1_000_000_000),
-        total.rem_euclid(1_000_000_000) as u32,
-    )
+    Value::Timestamp(total.div_euclid(1_000_000_000), total.rem_euclid(1_000_000_000) as u32)
 }
 
 fn numeric(v: &Value) -> Option<f64> {
@@ -535,20 +526,18 @@ fn numeric(v: &Value) -> Option<f64> {
 
 fn index_value(base: &Value, index: &Value) -> Value {
     match (base, index) {
-        (Value::List(items), Value::Int(i)) => match usize::try_from(*i)
-            .ok()
-            .and_then(|i| items.get(i))
-        {
-            Some(v) => v.clone(),
-            None => Value::undefined("index out of bounds"),
-        },
-        (Value::Str(s), Value::Int(i)) => match usize::try_from(*i)
-            .ok()
-            .and_then(|i| s.chars().nth(i))
-        {
-            Some(c) => Value::str(c.to_string()),
-            None => Value::undefined("index out of bounds"),
-        },
+        (Value::List(items), Value::Int(i)) => {
+            match usize::try_from(*i).ok().and_then(|i| items.get(i)) {
+                Some(v) => v.clone(),
+                None => Value::undefined("index out of bounds"),
+            }
+        }
+        (Value::Str(s), Value::Int(i)) => {
+            match usize::try_from(*i).ok().and_then(|i| s.chars().nth(i)) {
+                Some(c) => Value::str(c.to_string()),
+                None => Value::undefined("index out of bounds"),
+            }
+        }
         (Value::Map(m), Value::Str(k)) => match m.get(k.as_ref()) {
             Some(v) => v.clone(),
             None => Value::undefined(format!("property {k} is undefined")),

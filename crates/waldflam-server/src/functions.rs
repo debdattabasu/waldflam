@@ -101,10 +101,7 @@ fn parse_pattern(pattern: &str) -> Vec<PatternSeg> {
 }
 
 /// Matches a document path against a pattern, returning captured params.
-fn match_pattern(
-    segments: &[PatternSeg],
-    path: &ResourcePath,
-) -> Option<Vec<(String, String)>> {
+fn match_pattern(segments: &[PatternSeg], path: &ResourcePath) -> Option<Vec<(String, String)>> {
     let parts = path.segments();
     let mut params = Vec::new();
     let mut i = 0;
@@ -167,11 +164,7 @@ impl TriggerRegistry {
 }
 
 /// Subscribes to commits and dispatches matching trigger events.
-pub fn spawn_dispatcher(
-    hub: Arc<WatchHub>,
-    registry: Arc<TriggerRegistry>,
-    pool: DescriptorPool,
-) {
+pub fn spawn_dispatcher(hub: Arc<WatchHub>, registry: Arc<TriggerRegistry>, pool: DescriptorPool) {
     tokio::spawn(async move {
         let mut events = hub.subscribe();
         let client = reqwest::Client::new();
@@ -291,13 +284,12 @@ fn document_json(pool: &DescriptorPool, name: &str, doc: &StoredDocument) -> ser
         create_time: Some(crate::service::timestamp_from_us(doc.create_time_us)),
         update_time: Some(crate::service::timestamp_from_us(doc.update_time_us)),
     };
-    let descriptor = pool
-        .get_message_by_name("google.firestore.v1.Document")
-        .expect("Document descriptor");
+    let descriptor =
+        pool.get_message_by_name("google.firestore.v1.Document").expect("Document descriptor");
     use prost::Message as _;
     let bytes = wire.encode_to_vec();
-    let dynamic =
-        prost_reflect::DynamicMessage::decode(descriptor, bytes.as_slice()).expect("encode document");
+    let dynamic = prost_reflect::DynamicMessage::decode(descriptor, bytes.as_slice())
+        .expect("encode document");
     serde_json::to_value(&dynamic).unwrap_or(serde_json::Value::Null)
 }
 
@@ -372,10 +364,7 @@ mod tests {
         };
         let delta = |before, after| DocumentDelta { path: path("c/d"), before, after };
         assert_eq!(EventKind::actual(&delta(None, Some(doc(1)))), EventKind::Created);
-        assert_eq!(
-            EventKind::actual(&delta(Some(doc(1)), Some(doc(2)))),
-            EventKind::Updated
-        );
+        assert_eq!(EventKind::actual(&delta(Some(doc(1)), Some(doc(2)))), EventKind::Updated);
         assert_eq!(EventKind::actual(&delta(Some(doc(1)), None)), EventKind::Deleted);
         // `written` covers everything; specific kinds don't cross-match.
         assert!(EventKind::Written.covers(EventKind::Created));
@@ -389,10 +378,7 @@ mod tests {
         assert_eq!(chrono_rfc3339(0), "1970-01-01T00:00:00.000000Z");
         assert_eq!(chrono_rfc3339(1_000_000), "1970-01-01T00:00:01.000000Z");
         // Cross-checked against an independent date implementation.
-        assert_eq!(
-            chrono_rfc3339(1_785_000_000_000_000),
-            "2026-07-25T17:20:00.000000Z"
-        );
+        assert_eq!(chrono_rfc3339(1_785_000_000_000_000), "2026-07-25T17:20:00.000000Z");
         assert_eq!(chrono_rfc3339(1_785_000_000_123_456), "2026-07-25T17:20:00.123456Z");
     }
 }

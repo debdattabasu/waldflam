@@ -42,9 +42,7 @@ pub async fn run_query(
     // Candidate set.
     let mut docs = if selector.all_descendants {
         if !parent.is_empty() {
-            return Err(EngineError::Unimplemented(
-                "collection-group queries below the root",
-            ));
+            return Err(EngineError::Unimplemented("collection-group queries below the root"));
         }
         store.list_collection_group(database, &selector.collection_id).await?
     } else {
@@ -112,11 +110,7 @@ pub fn aggregate(
     use structured_aggregation_query::aggregation::Operator;
     let mut out = Vec::with_capacity(aggregations.len());
     for (i, agg) in aggregations.iter().enumerate() {
-        let alias = if agg.alias.is_empty() {
-            format!("field_{i}")
-        } else {
-            agg.alias.clone()
-        };
+        let alias = if agg.alias.is_empty() { format!("field_{i}") } else { agg.alias.clone() };
         let value = match agg.operator.as_ref() {
             Some(Operator::Count(count)) => {
                 let mut n = docs.len() as i64;
@@ -134,9 +128,7 @@ pub fn aggregate(
                 numeric_fold(docs, field).into_avg()
             }
             None => {
-                return Err(EngineError::InvalidArgument(
-                    "aggregation has no operator".into(),
-                ));
+                return Err(EngineError::InvalidArgument("aggregation has no operator".into()));
             }
         };
         out.push((alias, value));
@@ -191,10 +183,7 @@ impl NumericFold {
     }
 }
 
-fn flatten_and<'a>(
-    filter: &'a Filter,
-    out: &mut Vec<&'a FilterType>,
-) -> Result<(), EngineError> {
+fn flatten_and<'a>(filter: &'a Filter, out: &mut Vec<&'a FilterType>) -> Result<(), EngineError> {
     match filter.filter_type.as_ref() {
         None => Ok(()),
         Some(FilterType::CompositeFilter(c)) => {
@@ -247,8 +236,12 @@ fn query_eq(v: &Value, operand: &Value) -> bool {
 fn matches_filter(database: &DatabaseName, doc: &StoredDocument, filter: &&FilterType) -> bool {
     match filter {
         FilterType::FieldFilter(f) => {
-            let Some(field) = f.field.as_ref() else { return false };
-            let Some(operand) = f.value.as_ref() else { return false };
+            let Some(field) = f.field.as_ref() else {
+                return false;
+            };
+            let Some(operand) = f.value.as_ref() else {
+                return false;
+            };
             let Some(v) = field_value(database, doc, &field.field_path) else {
                 return false; // field must exist
             };
@@ -261,10 +254,12 @@ fn matches_filter(database: &DatabaseName, doc: &StoredDocument, filter: &&Filte
                 FieldOp::LessThanOrEqual => inequality(&v, operand, Ordering::Less, true),
                 FieldOp::GreaterThan => inequality(&v, operand, Ordering::Greater, false),
                 FieldOp::GreaterThanOrEqual => inequality(&v, operand, Ordering::Greater, true),
-                FieldOp::ArrayContains => array_elements(&v)
-                    .is_some_and(|els| els.iter().any(|e| query_eq(e, operand))),
-                FieldOp::In => array_elements(operand)
-                    .is_some_and(|ops| ops.iter().any(|o| query_eq(&v, o))),
+                FieldOp::ArrayContains => {
+                    array_elements(&v).is_some_and(|els| els.iter().any(|e| query_eq(e, operand)))
+                }
+                FieldOp::In => {
+                    array_elements(operand).is_some_and(|ops| ops.iter().any(|o| query_eq(&v, o)))
+                }
                 FieldOp::ArrayContainsAny => match (array_elements(&v), array_elements(operand)) {
                     (Some(els), Some(ops)) => {
                         els.iter().any(|e| ops.iter().any(|o| query_eq(e, o)))
@@ -275,8 +270,7 @@ fn matches_filter(database: &DatabaseName, doc: &StoredDocument, filter: &&Filte
                     !is_null(&v)
                         && !is_nan(&v)
                         && array_elements(operand).is_some_and(|ops| {
-                            !ops.iter().any(|o| is_null(o))
-                                && !ops.iter().any(|o| query_eq(&v, o))
+                            !ops.iter().any(is_null) && !ops.iter().any(|o| query_eq(&v, o))
                         })
                 }
                 FieldOp::Unspecified => false,
@@ -291,9 +285,7 @@ fn matches_filter(database: &DatabaseName, doc: &StoredDocument, filter: &&Filte
                 UnaryOp::IsNull => value.as_ref().is_some_and(is_null),
                 UnaryOp::IsNan => value.as_ref().is_some_and(is_nan),
                 UnaryOp::IsNotNull => value.as_ref().is_some_and(|v| !is_null(v)),
-                UnaryOp::IsNotNan => {
-                    value.as_ref().is_some_and(|v| !is_null(v) && !is_nan(v))
-                }
+                UnaryOp::IsNotNan => value.as_ref().is_some_and(|v| !is_null(v) && !is_nan(v)),
                 UnaryOp::Unspecified => false,
             }
         }
@@ -323,10 +315,7 @@ fn order_path(order: &Order) -> &str {
 
 fn normalize_orders(query: &StructuredQuery, filters: &[&FilterType]) -> Vec<Order> {
     let mut orders = query.order_by.clone();
-    let last_direction = orders
-        .last()
-        .map(|o| o.direction)
-        .unwrap_or(Direction::Ascending as i32);
+    let last_direction = orders.last().map(|o| o.direction).unwrap_or(Direction::Ascending as i32);
     let present: BTreeSet<String> = orders.iter().map(|o| order_path(o).to_owned()).collect();
 
     // Inequality-filtered fields, in canonical path order.
@@ -342,10 +331,8 @@ fn normalize_orders(query: &StructuredQuery, filters: &[&FilterType]) -> Vec<Ord
                     | FieldOp::NotEqual
                     | FieldOp::NotIn
             );
-            if is_inequality {
-                if let Some(field) = ff.field.as_ref() {
-                    inequality_paths.insert(field.field_path.clone());
-                }
+            if is_inequality && let Some(field) = ff.field.as_ref() {
+                inequality_paths.insert(field.field_path.clone());
             }
         }
     }
@@ -357,9 +344,7 @@ fn normalize_orders(query: &StructuredQuery, filters: &[&FilterType]) -> Vec<Ord
             });
         }
     }
-    if !present.contains("__name__")
-        && !orders.iter().any(|o| order_path(o) == "__name__")
-    {
+    if !present.contains("__name__") && !orders.iter().any(|o| order_path(o) == "__name__") {
         orders.push(Order {
             field: Some(FieldReference { field_path: "__name__".into() }),
             direction: last_direction,
@@ -369,11 +354,7 @@ fn normalize_orders(query: &StructuredQuery, filters: &[&FilterType]) -> Vec<Ord
 }
 
 fn apply_direction(ord: Ordering, direction: i32) -> Ordering {
-    if direction == Direction::Descending as i32 {
-        ord.reverse()
-    } else {
-        ord
-    }
+    if direction == Direction::Descending as i32 { ord.reverse() } else { ord }
 }
 
 fn compare_docs(
@@ -385,10 +366,8 @@ fn compare_docs(
     for order in orders {
         let path = order_path(order);
         // Order-by fields were checked for existence; __name__ always exists.
-        let (Some(va), Some(vb)) = (
-            field_value(database, a, path),
-            field_value(database, b, path),
-        ) else {
+        let (Some(va), Some(vb)) = (field_value(database, a, path), field_value(database, b, path))
+        else {
             continue;
         };
         let ord = apply_direction(compare_values(&va, &vb), order.direction);

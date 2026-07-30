@@ -39,7 +39,9 @@ pub fn global(name: &str, args: &[Value]) -> Value {
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
             Value::Path(p) => format!("/{}", p.join("/")),
-            other => return Value::undefined(format!("cannot convert {} to string", other.type_name())),
+            other => {
+                return Value::undefined(format!("cannot convert {} to string", other.type_name()));
+            }
         }),
         ("bool", [Value::Str(s)]) => match s.as_ref() {
             "true" => Value::Bool(true),
@@ -83,8 +85,18 @@ pub fn global(name: &str, args: &[Value]) -> Value {
                 "h" => n.checked_mul(3_600),
                 "m" => n.checked_mul(60),
                 "s" => Some(*n),
-                "ms" => return Value::Duration(n.div_euclid(1_000), (n.rem_euclid(1_000) * 1_000_000) as u32),
-                "ns" => return Value::Duration(n.div_euclid(1_000_000_000), n.rem_euclid(1_000_000_000) as u32),
+                "ms" => {
+                    return Value::Duration(
+                        n.div_euclid(1_000),
+                        (n.rem_euclid(1_000) * 1_000_000) as u32,
+                    );
+                }
+                "ns" => {
+                    return Value::Duration(
+                        n.div_euclid(1_000_000_000),
+                        n.rem_euclid(1_000_000_000) as u32,
+                    );
+                }
                 _ => return Value::undefined(format!("unknown duration unit {unit}")),
             };
             match seconds {
@@ -96,7 +108,9 @@ pub fn global(name: &str, args: &[Value]) -> Value {
             Value::Duration(h * 3600 + m * 60 + s, *ns as u32)
         }
         ("latlng.value", [a, b]) => match (numeric(a), numeric(b)) {
-            (Some(lat), Some(lng)) if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng) => {
+            (Some(lat), Some(lng))
+                if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng) =>
+            {
                 Value::LatLng(lat, lng)
             }
             (Some(_), Some(_)) => Value::undefined("latlng out of range"),
@@ -173,11 +187,7 @@ pub fn method(recv: &Value, name: &str, args: &[Value]) -> Value {
             Value::list(out)
         }
         (Value::List(items), "removeAll", [Value::List(other)]) => Value::list(
-            items
-                .iter()
-                .filter(|i| !other.iter().any(|o| o.equals(i)))
-                .cloned()
-                .collect(),
+            items.iter().filter(|i| !other.iter().any(|o| o.equals(i))).cloned().collect(),
         ),
         (Value::List(items), "toSet", []) => {
             let mut out: Vec<Value> = Vec::new();
@@ -255,7 +265,7 @@ pub fn method(recv: &Value, name: &str, args: &[Value]) -> Value {
         // ---- timestamp (UTC) ----
         (Value::Timestamp(s, n), _, []) => timestamp_method(*s, *n, name),
         // ---- duration ----
-        (Value::Duration(s, n), "seconds", []) => Value::Int(*s),
+        (Value::Duration(s, _n), "seconds", []) => Value::Int(*s),
         (Value::Duration(_, n), "nanos", []) => Value::Int(*n as i64),
 
         // ---- latlng ----
@@ -269,10 +279,7 @@ pub fn method(recv: &Value, name: &str, args: &[Value]) -> Value {
             Value::Float(2.0 * R * a.sqrt().asin())
         }
 
-        _ => Value::undefined(format!(
-            "method {name} is not defined on {}",
-            recv.type_name()
-        )),
+        _ => Value::undefined(format!("method {name} is not defined on {}", recv.type_name())),
     }
 }
 

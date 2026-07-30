@@ -48,9 +48,7 @@ where
             let stream_token = token.to_be_bytes().to_vec();
 
             if req.writes.is_empty() {
-                let ok = tx
-                    .send(Ok(WriteResponse { stream_token, ..Default::default() }))
-                    .await;
+                let ok = tx.send(Ok(WriteResponse { stream_token, ..Default::default() })).await;
                 if ok.is_err() {
                     return;
                 }

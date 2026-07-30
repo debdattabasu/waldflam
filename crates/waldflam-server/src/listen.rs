@@ -25,7 +25,12 @@ use crate::service::{timestamp_from_us, to_wire_document};
 
 enum TargetKind {
     Documents(Vec<ResourcePath>),
-    Query { parent: ResourcePath, query: StructuredQuery },
+    /// Boxed: `StructuredQuery` dwarfs the other variant, and targets are
+    /// built once per AddTarget, so the indirection is free in practice.
+    Query {
+        parent: ResourcePath,
+        query: Box<StructuredQuery>,
+    },
 }
 
 struct TargetState {
@@ -112,10 +117,7 @@ impl ListenSession {
     }
 
     async fn send(&self, response: listen_response::ResponseType) -> Flow {
-        self.out
-            .send(Ok(ListenResponse { response_type: Some(response) }))
-            .await
-            .map_err(|_| None)
+        self.out.send(Ok(ListenResponse { response_type: Some(response) })).await.map_err(|_| None)
     }
 
     async fn send_target_change(
@@ -153,16 +155,12 @@ impl ListenSession {
         match self.database.as_ref() {
             None => self.database = Some(database),
             Some(existing) if *existing != database => {
-                return Err(Some(Status::invalid_argument(
-                    "listen stream spans databases",
-                )));
+                return Err(Some(Status::invalid_argument("listen stream spans databases")));
             }
             Some(_) => {}
         }
         match req.target_change {
-            Some(listen_request::TargetChange::AddTarget(target)) => {
-                self.add_target(target).await
-            }
+            Some(listen_request::TargetChange::AddTarget(target)) => self.add_target(target).await,
             Some(listen_request::TargetChange::RemoveTarget(id)) => {
                 self.targets.remove(&id);
                 Ok(())
@@ -199,7 +197,7 @@ impl ListenSession {
                 else {
                     return Err(Some(Status::invalid_argument("missing structured_query")));
                 };
-                TargetKind::Query { parent: parent.path, query }
+                TargetKind::Query { parent: parent.path, query: Box::new(query) }
             }
             None => return Err(Some(Status::invalid_argument("missing target type"))),
         };
@@ -207,12 +205,10 @@ impl ListenSession {
         // Resuming: we don't replay deltas — RESET tells the client to drop
         // its state, then we send the full current state.
         if target.resume_type.is_some() {
-            self.send_target_change(TargetChangeType::Reset, vec![id], None, Vec::new())
-                .await?;
+            self.send_target_change(TargetChangeType::Reset, vec![id], None, Vec::new()).await?;
         }
 
-        self.send_target_change(TargetChangeType::Add, vec![id], None, Vec::new())
-            .await?;
+        self.send_target_change(TargetChangeType::Add, vec![id], None, Vec::new()).await?;
 
         let state = TargetState { kind, members: HashMap::new() };
         self.targets.insert(id, state);
@@ -472,8 +468,7 @@ impl ListenSession {
     async fn resync_all(&mut self) -> Flow {
         let ids: Vec<i32> = self.targets.keys().copied().collect();
         for id in ids {
-            self.send_target_change(TargetChangeType::Reset, vec![id], None, Vec::new())
-                .await?;
+            self.send_target_change(TargetChangeType::Reset, vec![id], None, Vec::new()).await?;
             if let Some(state) = self.targets.get_mut(&id) {
                 state.members.clear();
             }
@@ -485,8 +480,12 @@ impl ListenSession {
 
 /// Cheap pre-filter: could a change at `path` affect this query target?
 fn query_may_cover(parent: &ResourcePath, query: &StructuredQuery, path: &ResourcePath) -> bool {
-    let Some(selector) = query.from.first() else { return false };
-    let Some(collection) = path.parent() else { return false };
+    let Some(selector) = query.from.first() else {
+        return false;
+    };
+    let Some(collection) = path.parent() else {
+        return false;
+    };
     if selector.all_descendants {
         collection.last_id() == Some(selector.collection_id.as_str())
     } else {

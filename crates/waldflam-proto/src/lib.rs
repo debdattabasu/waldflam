@@ -15,6 +15,8 @@ pub mod google {
     }
     pub mod firestore {
         pub mod v1 {
+            // Generated code: variant sizes are prost's to decide, not ours.
+            #![allow(clippy::large_enum_variant)]
             tonic::include_proto!("google.firestore.v1");
         }
     }
@@ -24,5 +26,4 @@ pub use google::firestore::v1;
 
 /// Compiled descriptors for the whole surface — powers proto3-JSON
 /// transcoding on the REST endpoints.
-pub const FILE_DESCRIPTOR_SET: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));

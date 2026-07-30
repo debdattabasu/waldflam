@@ -46,10 +46,7 @@ async fn serves_firestore_service_over_h2c() {
 
     // Unparseable name → INVALID_ARGUMENT.
     let status = client
-        .get_document(GetDocumentRequest {
-            name: "not-a-name".into(),
-            ..Default::default()
-        })
+        .get_document(GetDocumentRequest { name: "not-a-name".into(), ..Default::default() })
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);

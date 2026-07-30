@@ -21,10 +21,8 @@ fn val(vt: ValueType) -> Value {
 
 fn test_db() -> DatabaseName {
     // Unique per run so tests don't collide with leftovers.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     DatabaseName::new(format!("test-{nanos}"), "(default)")
 }
 
@@ -61,10 +59,7 @@ async fn document_round_trip() {
         })),
     );
 
-    let created = store
-        .set_document(&db, &path, fields.clone(), 1_000)
-        .await
-        .unwrap();
+    let created = store.set_document(&db, &path, fields.clone(), 1_000).await.unwrap();
     assert_eq!(created.create_time_us, 1_000);
     assert_eq!(created.update_time_us, 1_000);
     assert_eq!(created.fields, fields);
@@ -77,10 +72,7 @@ async fn document_round_trip() {
     // Replace: update_time moves, create_time is preserved.
     let mut replaced_fields = HashMap::new();
     replaced_fields.insert("title".into(), val(ValueType::StringValue("bye".into())));
-    let replaced = store
-        .set_document(&db, &path, replaced_fields.clone(), 2_000)
-        .await
-        .unwrap();
+    let replaced = store.set_document(&db, &path, replaced_fields.clone(), 2_000).await.unwrap();
     assert_eq!(replaced.create_time_us, 1_000);
     assert_eq!(replaced.update_time_us, 2_000);
     assert_eq!(replaced.fields, replaced_fields);

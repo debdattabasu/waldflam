@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use waldflam_proto::v1::firestore_client::FirestoreClient;
 use waldflam_proto::v1::document_transform::FieldTransform;
 use waldflam_proto::v1::document_transform::field_transform::{ServerValue, TransformType};
+use waldflam_proto::v1::firestore_client::FirestoreClient;
 use waldflam_proto::v1::precondition::ConditionType;
 use waldflam_proto::v1::structured_query::field_filter::Operator as FieldOp;
 use waldflam_proto::v1::structured_query::filter::FilterType;
@@ -53,10 +53,8 @@ async fn boot() -> (FirestoreClient<tonic::transport::Channel>, String) {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
         }
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     (client, format!("projects/conf-{nanos}/databases/(default)"))
 }
 
@@ -72,12 +70,9 @@ async fn commit_get_query_round_trip() {
         .map(|(name, pop)| {
             set_write(
                 &doc(&format!("cities/{name}")),
-                [
-                    ("name".to_owned(), string(name)),
-                    ("population".to_owned(), int(*pop)),
-                ]
-                .into_iter()
-                .collect(),
+                [("name".to_owned(), string(name)), ("population".to_owned(), int(*pop))]
+                    .into_iter()
+                    .collect(),
             )
         })
         .collect();
@@ -91,17 +86,13 @@ async fn commit_get_query_round_trip() {
     assert!(resp.write_results[0].update_time.is_some());
 
     // Transforms: serverTimestamp + increment on a fresh doc.
-    let mut write = set_write(
-        &doc("cities/lyon"),
-        [("name".to_owned(), string("lyon"))].into_iter().collect(),
-    );
+    let mut write =
+        set_write(&doc("cities/lyon"), [("name".to_owned(), string("lyon"))].into_iter().collect());
     write.update_mask = Some(DocumentMask { field_paths: vec!["name".into()] });
     write.update_transforms = vec![
         FieldTransform {
             field_path: "updated".into(),
-            transform_type: Some(TransformType::SetToServerValue(
-                ServerValue::RequestTime as i32,
-            )),
+            transform_type: Some(TransformType::SetToServerValue(ServerValue::RequestTime as i32)),
         },
         FieldTransform {
             field_path: "population".into(),
@@ -132,7 +123,8 @@ async fn commit_get_query_round_trip() {
     // Preconditions: exists=false on an existing doc → ALREADY_EXISTS;
     // exists=true on a missing doc → NOT_FOUND.
     let mut write = set_write(&doc("cities/lyon"), HashMap::new());
-    write.current_document = Some(Precondition { condition_type: Some(ConditionType::Exists(false)) });
+    write.current_document =
+        Some(Precondition { condition_type: Some(ConditionType::Exists(false)) });
     let status = client
         .commit(CommitRequest { database: db.clone(), writes: vec![write], ..Default::default() })
         .await
@@ -140,7 +132,8 @@ async fn commit_get_query_round_trip() {
     assert_eq!(status.code(), tonic::Code::AlreadyExists);
 
     let mut write = set_write(&doc("cities/atlantis"), HashMap::new());
-    write.current_document = Some(Precondition { condition_type: Some(ConditionType::Exists(true)) });
+    write.current_document =
+        Some(Precondition { condition_type: Some(ConditionType::Exists(true)) });
     let status = client
         .commit(CommitRequest { database: db.clone(), writes: vec![write], ..Default::default() })
         .await
@@ -228,10 +221,8 @@ async fn commit_get_query_round_trip() {
     assert_eq!((found, missing), (1, 1));
 
     // Delete via commit, then the doc is gone.
-    let delete = Write {
-        operation: Some(Operation::Delete(doc("cities/tokyo"))),
-        ..Default::default()
-    };
+    let delete =
+        Write { operation: Some(Operation::Delete(doc("cities/tokyo"))), ..Default::default() };
     client
         .commit(CommitRequest { database: db.clone(), writes: vec![delete], ..Default::default() })
         .await

@@ -118,10 +118,7 @@ impl NumberParts {
         if self.is_zero() {
             return 0;
         }
-        assert!(
-            (0..=63).contains(&self.exponent),
-            "not an i64: {self:?}"
-        );
+        assert!((0..=63).contains(&self.exponent), "not an i64: {self:?}");
         if self.exponent == 63 {
             assert!(self.negative && self.significand == 0, "i64 overflow: {self:?}");
             return i64::MIN;
@@ -132,7 +129,8 @@ impl NumberParts {
             "fractional part: {self:?}"
         );
         let leading_zeros = 63 - self.exponent as u32;
-        let fraction = if leading_zeros == 63 { 0 } else { self.significand >> (leading_zeros + 1) };
+        let fraction =
+            if leading_zeros == 63 { 0 } else { self.significand >> (leading_zeros + 1) };
         let magnitude = fraction | (1u64 << self.exponent);
         let value = magnitude as i64;
         if self.negative { -value } else { value }
@@ -253,7 +251,7 @@ pub fn decode_number(bytes: &[u8]) -> Result<(NumberParts, usize), DecodeError> 
             }
             exponent_magnitude = 0;
         }
-        -3 | -2 | -1 => {
+        -3..=-1 => {
             let exp = (4 + marker) as u32; // 1..=3
             exponent_magnitude = exp;
             write_bit = 64 - exp as i32;
@@ -300,9 +298,13 @@ pub fn decode_number(bytes: &[u8]) -> Result<(NumberParts, usize), DecodeError> 
             // Sentinels: zero, ±infinity, NaN.
             let parts = match (negative, exponent_negative) {
                 (false, true) | (true, true) => NumberParts::ZERO,
-                (false, false) => NumberParts { negative: false, exponent: i32::MAX, significand: 0 },
+                (false, false) => {
+                    NumberParts { negative: false, exponent: i32::MAX, significand: 0 }
+                }
                 (true, false) => match bytes.get(1) {
-                    Some(0x80) => NumberParts { negative: true, exponent: i32::MAX, significand: 0 },
+                    Some(0x80) => {
+                        NumberParts { negative: true, exponent: i32::MAX, significand: 0 }
+                    }
                     Some(0x60) => NumberParts::NAN,
                     _ => return err("invalid sentinel"),
                 },
@@ -331,11 +333,8 @@ pub fn decode_number(bytes: &[u8]) -> Result<(NumberParts, usize), DecodeError> 
         }
     }
 
-    let exponent = if exponent_negative {
-        -(exponent_magnitude as i32)
-    } else {
-        exponent_magnitude as i32
-    };
+    let exponent =
+        if exponent_negative { -(exponent_magnitude as i32) } else { exponent_magnitude as i32 };
     Ok((NumberParts { negative, exponent, significand }, pos))
 }
 
@@ -394,19 +393,41 @@ mod tests {
         c
     }
 
+    // 3.14159… here is just another f64 to round-trip, not an attempt at PI.
+    #[allow(clippy::approx_constant)]
     fn f64_corpus() -> Vec<f64> {
         let mut c = vec![
-            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 0.25, 1.5, -1.5, 2.5, 3.75,
-            f64::NAN, f64::INFINITY, f64::NEG_INFINITY,
-            f64::MIN_POSITIVE,                 // smallest normal
-            f64::MIN_POSITIVE / 4.0,           // subnormal
-            5e-324,                            // smallest subnormal
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            0.25,
+            1.5,
+            -1.5,
+            2.5,
+            3.75,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,       // smallest normal
+            f64::MIN_POSITIVE / 4.0, // subnormal
+            5e-324,                  // smallest subnormal
             -5e-324,
-            f64::MAX, f64::MIN,
-            1e-300, -1e-300, 1e300, -1e300,
-            (1u64 << 53) as f64, ((1u64 << 53) + 2) as f64,
-            9.3e18, -9.3e18,                   // beyond i64 range
-            0.1, -0.1, 3.141592653589793,
+            f64::MAX,
+            f64::MIN,
+            1e-300,
+            -1e-300,
+            1e300,
+            -1e300,
+            (1u64 << 53) as f64,
+            ((1u64 << 53) + 2) as f64,
+            9.3e18,
+            -9.3e18, // beyond i64 range
+            0.1,
+            -0.1,
+            3.141592653589793,
         ];
         // Exercise every exponent bucket boundary: |e| in {3,4,19,20,147,148}.
         for e in [3i32, 4, 19, 20, 147, 148, -3, -4, -19, -20, -147, -148] {

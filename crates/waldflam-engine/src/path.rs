@@ -18,10 +18,7 @@ pub struct DatabaseName {
 
 impl DatabaseName {
     pub fn new(project_id: impl Into<String>, database_id: impl Into<String>) -> Self {
-        Self {
-            project_id: project_id.into(),
-            database_id: database_id.into(),
-        }
+        Self { project_id: project_id.into(), database_id: database_id.into() }
     }
 
     /// Parses `projects/{p}/databases/{d}`, tolerating a trailing
@@ -44,9 +41,7 @@ impl DatabaseName {
     pub fn parse(name: &str) -> Result<Self, EngineError> {
         match Self::parse_prefix(name)? {
             (db, "") => Ok(db),
-            _ => Err(EngineError::InvalidArgument(format!(
-                "invalid database name: {name:?}"
-            ))),
+            _ => Err(EngineError::InvalidArgument(format!("invalid database name: {name:?}"))),
         }
     }
 
@@ -103,7 +98,7 @@ impl ResourcePath {
     }
 
     pub fn is_document(&self) -> bool {
-        !self.segments.is_empty() && self.segments.len() % 2 == 0
+        !self.segments.is_empty() && self.segments.len().is_multiple_of(2)
     }
 
     pub fn is_collection(&self) -> bool {
@@ -129,9 +124,7 @@ impl ResourcePath {
         if self.segments.is_empty() {
             return None;
         }
-        Some(Self {
-            segments: self.segments[..self.segments.len() - 1].to_vec(),
-        })
+        Some(Self { segments: self.segments[..self.segments.len() - 1].to_vec() })
     }
 
     pub fn child(&self, id: &str) -> Result<Self, EngineError> {
@@ -179,9 +172,7 @@ impl ResourceName {
     pub fn parse_document(name: &str) -> Result<Self, EngineError> {
         let parsed = Self::parse(name)?;
         if !parsed.path.is_document() {
-            return Err(EngineError::InvalidArgument(format!(
-                "not a document name: {name:?}"
-            )));
+            return Err(EngineError::InvalidArgument(format!("not a document name: {name:?}")));
         }
         Ok(parsed)
     }
@@ -226,14 +217,12 @@ mod tests {
 
     #[test]
     fn parses_resource_names() {
-        let n = ResourceName::parse("projects/p/databases/(default)/documents/users/alice").unwrap();
+        let n =
+            ResourceName::parse("projects/p/databases/(default)/documents/users/alice").unwrap();
         assert!(n.path.is_document());
         assert_eq!(n.path.collection_id(), Some("users"));
         assert_eq!(n.path.last_id(), Some("alice"));
-        assert_eq!(
-            n.to_string(),
-            "projects/p/databases/(default)/documents/users/alice"
-        );
+        assert_eq!(n.to_string(), "projects/p/databases/(default)/documents/users/alice");
 
         let c = ResourceName::parse("projects/p/databases/d/documents/users").unwrap();
         assert!(c.path.is_collection());
@@ -244,9 +233,7 @@ mod tests {
 
         assert!(ResourceName::parse("projects/p/databases/d").is_err());
         assert!(ResourceName::parse("projects/p/databases/d/documents/users//x").is_err());
-        assert!(
-            ResourceName::parse_document("projects/p/databases/d/documents/users").is_err()
-        );
+        assert!(ResourceName::parse_document("projects/p/databases/d/documents/users").is_err());
     }
 
     #[test]

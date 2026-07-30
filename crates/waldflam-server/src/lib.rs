@@ -23,37 +23,24 @@ pub async fn serve(addr: SocketAddr, store: Store) -> anyhow::Result<()> {
     let pool = rest::descriptor_pool();
     let triggers: Arc<functions::TriggerRegistry> = Default::default();
     functions::spawn_dispatcher(svc.hub_handle(), triggers.clone(), pool.clone());
-    let rest_state = rest::RestState {
-        svc: svc.clone(),
-        pool,
-        sessions: Default::default(),
-        triggers,
-    };
+    let rest_state =
+        rest::RestState { svc: svc.clone(), pool, sessions: Default::default(), triggers };
 
     let grpc = tonic::service::Routes::new(FirestoreServer::from_arc(svc));
     let rest_router = axum::Router::new()
         .route("/", axum::routing::get(rest::health))
         .route("/v1/{*path}", axum::routing::post(rest::v1_post))
-        .route(
-            "/emulator/v1/projects/{project}",
-            axum::routing::put(rest::set_security_rules),
-        )
+        .route("/emulator/v1/projects/{project}", axum::routing::put(rest::set_security_rules))
         .route(
             "/emulator/v1/projects/{project}/databases/{database}/documents",
             axum::routing::delete(rest::clear_data),
         )
-        .route(
-            "/emulator/v1/projects/{project}/triggers",
-            axum::routing::put(rest::set_triggers),
-        )
+        .route("/emulator/v1/projects/{project}/triggers", axum::routing::put(rest::set_triggers))
         .with_state(rest_state.clone());
     let router = grpc
         .into_axum_router()
         .merge(rest_router)
-        .layer(axum::middleware::from_fn_with_state(
-            rest_state,
-            webchannel::intercept,
-        ))
+        .layer(axum::middleware::from_fn_with_state(rest_state, webchannel::intercept))
         .layer(axum::middleware::from_fn(rest::cors));
 
     tracing::info!(%addr, "waldflam listening (gRPC h2c + REST v1)");

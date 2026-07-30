@@ -52,9 +52,20 @@ pub struct FunctionDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    Eq, Ne, Lt, Le, Gt, Ge,
-    And, Or, In,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    In,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +84,11 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>),
     Range(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
     /// `target.name(args)` or bare `name(args)`.
-    Call { target: Option<Box<Expr>>, name: String, args: Vec<Expr> },
+    Call {
+        target: Option<Box<Expr>>,
+        name: String,
+        args: Vec<Expr>,
+    },
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),

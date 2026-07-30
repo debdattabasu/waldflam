@@ -153,17 +153,11 @@ fn stdlib_behaviors() {
     assert_eq!(truth("math.abs(-3) == 3"), Some(true));
     // duration/timestamp constructors.
     assert_eq!(truth("duration.value(1, 'h').seconds() == 3600"), Some(true));
-    assert_eq!(
-        truth("timestamp.date(2026, 7, 30).year() == 2026"),
-        Some(true)
-    );
+    assert_eq!(truth("timestamp.date(2026, 7, 30).year() == 2026"), Some(true));
     assert_eq!(truth("timestamp.date(2026, 7, 30).month() == 7"), Some(true));
     assert_eq!(truth("timestamp.date(2026, 7, 30).day() == 30"), Some(true));
     // map.diff
-    assert_eq!(
-        truth("{'a':1,'b':2}.diff({'a':1,'b':3}).changedKeys() == ['b']"),
-        Some(true)
-    );
+    assert_eq!(truth("{'a':1,'b':2}.diff({'a':1,'b':3}).changedKeys() == ['b']"), Some(true));
 }
 
 fn decide(rules: &str, op: Operation, path: &[&str], globals: Vec<(&str, Value)>) -> Decision {
@@ -181,15 +175,7 @@ fn decide_with_host(
     let path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
     let globals: Vec<(String, Value)> =
         globals.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
-    evaluate(
-        &ruleset,
-        "cloud.firestore",
-        op,
-        &path,
-        &globals,
-        &mut host,
-    )
-    .expect("no fatal")
+    evaluate(&ruleset, "cloud.firestore", op, &path, &globals, &mut host).expect("no fatal")
 }
 
 const OPEN: &str = r#"
@@ -205,9 +191,16 @@ service cloud.firestore {
 
 #[test]
 fn open_rules_allow_everything() {
-    for op in [Operation::Get, Operation::List, Operation::Create, Operation::Update, Operation::Delete] {
+    for op in
+        [Operation::Get, Operation::List, Operation::Create, Operation::Update, Operation::Delete]
+    {
         assert_eq!(
-            decide(OPEN, op, &["databases", "(default)", "documents", "users", "alice"], Vec::new()),
+            decide(
+                OPEN,
+                op,
+                &["databases", "(default)", "documents", "users", "alice"],
+                Vec::new()
+            ),
             Decision::Allow,
             "{op:?}"
         );
@@ -226,7 +219,12 @@ service cloud.firestore {
   }
 }"#;
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "c", "d"], Vec::new()),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "c", "d"],
+            Vec::new()
+        ),
         Decision::Deny
     );
 }
@@ -309,14 +307,21 @@ service cloud.firestore {
   }
 }"#;
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "c", "x"], Vec::new()),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "c", "x"],
+            Vec::new()
+        ),
         Decision::Allow
     );
 }
 
 #[test]
 fn v2_glob_matches_zero_segments_v1_requires_one() {
-    let body = |version: &str| format!(r#"
+    let body = |version: &str| {
+        format!(
+            r#"
 rules_version = '{version}';
 service cloud.firestore {{
   match /databases/{{db}}/documents {{
@@ -324,7 +329,9 @@ service cloud.firestore {{
       allow read: if true;
     }}
   }}
-}}"#);
+}}"#
+        )
+    };
     let deep = ["databases", "(default)", "documents", "c", "d", "sub", "x"];
     let bare = ["databases", "(default)", "documents", "c"];
     // Deep paths match under both versions.
@@ -363,16 +370,31 @@ service cloud.firestore {
     let globals = vec![("request", Value::map(request))];
 
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "users", "alice"], globals.clone()),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "users", "alice"],
+            globals.clone()
+        ),
         Decision::Allow
     );
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "users", "alice", "private", "p1"], globals.clone()),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "users", "alice", "private", "p1"],
+            globals.clone()
+        ),
         Decision::Allow,
         "nested match with capture from parent"
     );
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "users", "bob", "private", "p1"], globals),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "users", "bob", "private", "p1"],
+            globals
+        ),
         Decision::Deny,
         "not the owner"
     );
@@ -390,10 +412,8 @@ service cloud.firestore {
     }
   }
 }"#;
-    let host = TestHost::new().with(
-        "databases/(default)/documents/roles/alice",
-        vec![("admin", Value::Bool(true))],
-    );
+    let host = TestHost::new()
+        .with("databases/(default)/documents/roles/alice", vec![("admin", Value::Bool(true))]);
     let mut auth = BTreeMap::new();
     auth.insert("uid".to_owned(), Value::str("alice"));
     let mut request = BTreeMap::new();
@@ -412,14 +432,9 @@ service cloud.firestore {
     );
 
     // Non-admin role: get() succeeds but the value denies.
-    let host = TestHost::new().with(
-        "databases/(default)/documents/roles/alice",
-        vec![("admin", Value::Bool(false))],
-    );
-    assert_eq!(
-        decide_with_host(rules, Operation::Update, &path, globals, host),
-        Decision::Deny
-    );
+    let host = TestHost::new()
+        .with("databases/(default)/documents/roles/alice", vec![("admin", Value::Bool(false))]);
+    assert_eq!(decide_with_host(rules, Operation::Update, &path, globals, host), Decision::Deny);
 }
 
 #[test]
@@ -460,7 +475,12 @@ service cloud.firestore {
   }
 }"#;
     assert_eq!(
-        decide(rules, Operation::Get, &["databases", "(default)", "documents", "public", "x"], Vec::new()),
+        decide(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "public", "x"],
+            Vec::new()
+        ),
         Decision::Allow
     );
 }
@@ -483,10 +503,8 @@ service cloud.firestore {
 }"#;
     let ruleset = parse(rules).expect("parse");
     let mut host = TestHost::new();
-    let path: Vec<String> = ["databases", "(default)", "documents", "c", "x"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+    let path: Vec<String> =
+        ["databases", "(default)", "documents", "c", "x"].iter().map(|s| (*s).to_owned()).collect();
     let result = evaluate(&ruleset, "cloud.firestore", Operation::Get, &path, &[], &mut host);
     assert!(result.is_err(), "runaway recursion must be fatal, not a hang");
 }
@@ -510,7 +528,13 @@ service cloud.firestore {
         .with("databases/(default)/documents/x/b", vec![])
         .with("databases/(default)/documents/x/c", vec![]);
     assert_eq!(
-        decide_with_host(rules, Operation::Get, &["databases", "(default)", "documents", "c", "x"], Vec::new(), host),
+        decide_with_host(
+            rules,
+            Operation::Get,
+            &["databases", "(default)", "documents", "c", "x"],
+            Vec::new(),
+            host
+        ),
         Decision::Allow
     );
 }
@@ -528,7 +552,7 @@ fn undefined_argument_short_circuits_before_backend_call() {
 
 #[test]
 fn version_defaults_to_v1_when_absent() {
-    let ruleset = parse("service cloud.firestore { match /a/{b} { allow read: if true; } }")
-        .expect("parse");
+    let ruleset =
+        parse("service cloud.firestore { match /a/{b} { allow read: if true; } }").expect("parse");
     assert_eq!(ruleset.version, Version::V1);
 }

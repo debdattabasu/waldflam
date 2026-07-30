@@ -13,9 +13,33 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     // punctuation / operators
-    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semi, Colon, Question, Dot, Slash, Star, Percent, Plus, Minus,
-    Eq, EqEq, NotEq, Lt, Le, Gt, Ge, AndAnd, OrOr, Not, Assign,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semi,
+    Colon,
+    Question,
+    Dot,
+    Slash,
+    Star,
+    Percent,
+    Plus,
+    Minus,
+    Eq,
+    EqEq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    AndAnd,
+    OrOr,
+    Not,
+    Assign,
     Eof,
 }
 
@@ -265,9 +289,7 @@ impl<'a> Lexer<'a> {
             while self.peek().is_ascii_digit() {
                 text.push(self.bump() as char);
             }
-            return Ok(Tok::Float(
-                text.parse().map_err(|_| self.err("invalid float literal"))?,
-            ));
+            return Ok(Tok::Float(text.parse().map_err(|_| self.err("invalid float literal"))?));
         }
         match text.parse::<i64>() {
             Ok(i) => Ok(Tok::Int(i)),
