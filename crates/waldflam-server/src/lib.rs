@@ -2,6 +2,7 @@ pub mod auth;
 pub mod listen;
 pub mod rest;
 pub mod service;
+pub mod write_stream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

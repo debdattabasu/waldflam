@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Status, Streaming};
+use tokio_stream::{Stream, StreamExt};
+use tonic::Status;
 use waldflam_engine::path::{DatabaseName, ResourceName, ResourcePath};
 use waldflam_engine::store::{Store, StoredDocument};
 use waldflam_engine::watch::{CommitEvent, WatchHub};
@@ -42,11 +43,14 @@ pub struct ListenSession {
     out: mpsc::Sender<Result<ListenResponse, Status>>,
 }
 
-pub fn spawn(
+pub fn spawn<S>(
     store: Store,
     hub: Arc<WatchHub>,
-    mut requests: Streaming<ListenRequest>,
-) -> ReceiverStream<Result<ListenResponse, Status>> {
+    mut requests: S,
+) -> ReceiverStream<Result<ListenResponse, Status>>
+where
+    S: Stream<Item = Result<ListenRequest, Status>> + Send + Unpin + 'static,
+{
     let (tx, rx) = mpsc::channel(256);
     let mut session = ListenSession {
         store,
@@ -60,8 +64,8 @@ pub fn spawn(
         let mut events = hub.subscribe();
         loop {
             tokio::select! {
-                request = requests.message() => match request {
-                    Ok(Some(req)) => {
+                request = requests.next() => match request {
+                    Some(Ok(req)) => {
                         if let Err(end) = session.handle_request(req).await {
                             if let Some(status) = end {
                                 let _ = session.out.send(Err(status)).await;
@@ -70,7 +74,7 @@ pub fn spawn(
                         }
                     }
                     // Client half-closed or dropped: end the stream.
-                    Ok(None) | Err(_) => break,
+                    None | Some(Err(_)) => break,
                 },
                 event = events.recv() => match event {
                     Ok(event) => {
