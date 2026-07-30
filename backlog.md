@@ -138,23 +138,52 @@ These are the ones to fix before calling waldflam production-ready.
 
 ## Operations & ecosystem
 
-- **Admin is a shared secret, not a signed credential.** `WALDFLAM_ADMIN_TOKEN`
-  is a bearer secret: anyone holding it is admin, it doesn't expire, and
-  rotating it means a restart. Firebase uses service-account-signed tokens
-  with real identities. Fix: accept signed service-account tokens, or at
-  least support multiple named secrets that can be rotated one at a time.
-- **No custom claims → rules integration beyond the token payload.** Whatever
-  the issuer puts in the JWT is what rules see. There's no way to attach
-  server-side roles to a uid without the issuer minting them.
-- **Verified mode is untested end to end by the conformance suites.** The
-  verifier has unit tests (signature, expiry, issuer, audience, tampering,
-  unknown key, no `owner` backdoor) and the admin gating was checked by hand,
-  but no harness runs an SDK against a verifying server — that needs a test
-  issuer with a JWKS endpoint.
-- No TLS termination (plaintext h2c only), no rate limiting, no quotas.
-- No metrics/tracing export; logging is minimal.
-- No CI. The conformance matrix should run on every push — it's the main
-  regression net and it currently only runs when invoked by hand.
+- **The signing key can't be rotated.** Storage and the JWKS endpoint both
+  handle a key set, and retired keys would keep verifying tokens already in
+  flight — but nothing promotes a new key or retires the old one. Today
+  rotating means deleting the record, which invalidates every outstanding
+  token at once.
+- **Individual refresh tokens can't be revoked.** They're signed rather than
+  stored, which keeps a database read off the hot path but means the only way
+  to invalidate one before its 30 days are up is to rotate the signing key
+  (see above). A stolen refresh token is therefore long-lived. Fix: a
+  revocation list keyed by uid + issued-at, or stored refresh tokens.
+- **Revocation has a 30-second window.** Service-account lookups are cached
+  for `ACCOUNT_CACHE_TTL`, so a revoked credential keeps working for up to
+  that long on an instance that has seen it recently. Deliberate — the
+  alternative is a MongoDB read per request — but it is a real window, and a
+  deployment that needs immediate revocation would want the cache invalidated
+  through the commit-notice channel instead.
+- **Service accounts are project-scoped but not permission-scoped.** A service
+  account is admin of its project, full stop; there is no notion of a
+  read-only or collection-scoped credential, and OAuth2 `scope` on the
+  assertion is ignored.
+- **The private key lives in MongoDB.** waldflam must hold it to mint tokens,
+  so anyone who can read the database can mint any identity. That makes the
+  MongoDB deployment part of the trust boundary — fine when they're operated
+  together, worth an envelope-encryption story otherwise.
+- **`WALDFLAM_PUBLIC_URL` is load-bearing and silent about it.** It becomes
+  the `iss` of every minted token and is compared on the way back in, so
+  changing it invalidates outstanding tokens, and getting it wrong emits key
+  files pointing somewhere clients can't reach. Nothing validates it or warns
+  when it stays at the loopback default.
+- **Google auth libraries disagree about `token_uri`.** Go's
+  `google.JWTConfigFromJSON` honours it, so the Go Admin SDK can authenticate
+  against a waldflam key file end to end; the Node libraries hardcode
+  Google's token URL, so `firebase-admin`'s `credential.cert()` path will not
+  reach us. Both flows are implemented (exchange *and* assertion-as-bearer),
+  but only the raw wire contract is covered by conformance — no suite drives
+  an actual Admin SDK in non-emulator mode.
+- **No custom claims → rules integration beyond the token payload.** waldflam
+  can now mint ID tokens with arbitrary custom claims, so this is solved for
+  identities it issues; there is still no way to attach server-side roles to a
+  uid that an *external* issuer minted.
+- No TLS termination (plaintext h2c only), no rate limiting, no quotas. Note
+  that credentials over plaintext h2c are only as private as the network —
+  put a TLS terminator in front of any deployment that leaves a host.
+- No metrics/tracing export; logging is minimal. Authentication failures in
+  particular are not counted or sampled, so a credential-stuffing attempt
+  looks like nothing at all.
 - No data import/export, and no `firebase emulators:start` integration
   (emulator hub discovery endpoints).
 - Multi-database support is structurally present (`{project}~{database}`

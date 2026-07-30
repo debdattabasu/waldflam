@@ -62,16 +62,17 @@ Full design, per-SDK wire contracts, and the implementation map: see
 runs unchanged — the Go client, firestore-rs, and the JS SDK in all three
 flavors (Node/gRPC, lite/REST, browser/WebChannel) — across CRUD, queries,
 aggregations, transactions with contention retries, realtime listeners,
-streaming writes, security rules, and Cloud Functions triggers. Seven
+streaming writes, security rules, and Cloud Functions triggers. Eight
 conformance suites in [conformance/](conformance/) prove it against a live
-server on every run.
+server on every run — the eighth against a server that verifies signatures,
+with credentials waldflam issued itself.
 
-Still **pre-alpha for production**: admin access in verified mode is a shared
-secret rather than a signed credential, and queries whose filters can't be
-expressed exactly — `!=`, `not-in`, `OR` — still page in the server rather
-than the database. Those and everything else known-missing are catalogued
-honestly in [backlog.md](backlog.md) — read it before deploying anything you
-care about.
+Still **pre-alpha for production**: queries whose filters can't be expressed
+exactly — `!=`, `not-in`, `OR` — still page in the server rather than the
+database, and multi-filter queries get single-field selectivity because there
+are no composite indexes yet. Those and everything else known-missing are
+catalogued honestly in [backlog.md](backlog.md) — read it before deploying
+anything you care about.
 
 ## Authentication
 
@@ -80,26 +81,70 @@ verified and `Bearer owner` is admin. That is what the SDKs' emulator mode
 expects, and it is correct for local development — but it trusts anything it
 is handed, so don't expose it.
 
-For a deployment anyone can reach, turn on verification:
+For a deployment anyone can reach:
 
 ```sh
 WALDFLAM_AUTH=verify
+WALDFLAM_PUBLIC_URL=https://waldflam.example.com   # how clients reach you
+```
+
+That's the whole configuration. Every token now needs a real RS256 signature,
+the `owner` backdoor is gone, and the `/emulator/v1` endpoints — which load
+rules and erase databases — require admin.
+
+### Credentials
+
+waldflam issues its own, so verified mode needs no identity provider behind
+it. **Service accounts** are the machine credential:
+
+```sh
+waldflam credentials create backend --project my-project > key.json
+waldflam credentials list
+waldflam credentials revoke backend@my-project.iam.waldflam.local
+```
+
+`key.json` has the same shape as a Google service-account key file, and
+waldflam keeps only the public half — the private key is printed once and
+never stored, so a database dump can't be replayed into working credentials.
+Holding it proves the identity two ways, because Google's auth libraries
+disagree about which to use and a server can't dictate the choice: exchange a
+signed assertion at `/oauth2/v4/token` for a short-lived access token (the
+OAuth2 JWT-bearer grant), or send the assertion straight through as the bearer.
+
+That gets you a *named*, expiring, revocable, project-scoped admin — where a
+shared secret names nobody, never expires, and needs a restart to rotate.
+Revoking one stops the assertions **and** the access tokens already handed
+out, everywhere, within 30 seconds.
+
+**User identities** work the way Firebase's do. A service account mints a
+custom token for a `uid`; the client trades it in and gets back an ID token
+that waldflam signed:
+
+```sh
+POST /v1/accounts:signInWithCustomToken   {"token": "<custom token>"}
+POST /v1/token                            grant_type=refresh_token&refresh_token=…
+```
+
+Custom claims ride along into `request.auth.token`, so rules see them. The
+signing keys are published at `/.well-known/jwks.json` with OIDC discovery at
+`/.well-known/openid-configuration`, which is what lets waldflam verify what
+it issued — and lets anything else verify it too.
+
+`WALDFLAM_ADMIN_TOKEN` still works as a shared-secret admin if you want one;
+it's documented as the weaker option because it is. To keep using an existing
+identity provider instead — Firebase Auth, say, while you migrate off it —
+point waldflam at its JWKS and its tokens are accepted alongside waldflam's
+own:
+
+```sh
 WALDFLAM_AUTH_ISSUER=https://securetoken.google.com/my-project
 WALDFLAM_AUTH_AUDIENCE=my-project
 WALDFLAM_AUTH_JWKS_URL=https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
-WALDFLAM_ADMIN_TOKEN=<a long random secret>   # optional
 ```
 
-Tokens then need a real RS256 signature from a key at that JWKS endpoint,
-plus a matching issuer and audience. The `owner` backdoor does not exist in
-this mode, and the `/emulator/v1` admin endpoints — which load rules and
-erase databases — require the admin token. Leave `WALDFLAM_ADMIN_TOKEN`
-unset and nothing can bypass security rules at all. Any issuer publishing a
-JWK Set works; the values above are Firebase Auth's.
-
-waldflam refuses to start if `verify` is requested without the issuer,
-audience, and JWKS URL — silently falling back to trusting unsigned tokens
-would be worse than not booting.
+All three or none: waldflam refuses to start half-configured, because a
+verifier that can't verify would reject every token from an issuer the
+operator believed was working.
 
 - [x] **M0 — scaffold**: workspace, full 17-RPC `google.firestore.v1` gRPC
   surface served on h2c, value ordering + resource-name parsing + emulator
@@ -120,15 +165,17 @@ would be worse than not booting.
   events delivered as CloudEvents to your HTTP endpoints, with path-pattern
   params and before/after payloads
 
-Next up is depth rather than breadth — production auth, then composite
-indexes. Three pieces already landed: commits are **atomic** (each runs in a
-MongoDB transaction, so a batch never half-lands and concurrent writers can't
-lose an update), waldflam runs **multi-instance** (every commit is announced
-through a change stream, so a listener on one instance sees writes applied on
-any of them), and queries are **index-backed end to end** — filters, ordering,
-cursors, and `limit` all become MongoDB predicates over stored
-order-preserving keys, so a paged query reads its page rather than the whole
-match set. See [backlog.md](backlog.md).
+Next up is depth rather than breadth — composite indexes. Four pieces already
+landed: commits are **atomic** (each runs in a MongoDB transaction, so a batch
+never half-lands and concurrent writers can't lose an update), waldflam runs
+**multi-instance** (every commit is announced through a change stream, so a
+listener on one instance sees writes applied on any of them), queries are
+**index-backed end to end** (filters, ordering, cursors, and `limit` all
+become MongoDB predicates over stored order-preserving keys, so a paged query
+reads its page rather than the whole match set), and **credentials are real** —
+signed service accounts and waldflam-issued user identities, so a verified
+deployment depends on no identity provider but itself. See
+[backlog.md](backlog.md).
 
 ## Cloud Functions triggers
 
@@ -167,8 +214,19 @@ cd conformance/js   && npm install && node main.mjs   # Node / gRPC
                                    node triggers.mjs  # functions triggers
 ```
 
+The credentials suite needs a server that actually verifies signatures, so it
+gets its own:
+
+```sh
+waldflam credentials create ci --project cred-ci --out key.json
+WALDFLAM_AUTH=verify WALDFLAM_LISTEN=127.0.0.1:8099 \
+  WALDFLAM_PUBLIC_URL=http://127.0.0.1:8099 waldflam &
+cd conformance/js && WALDFLAM_PORT=8099 WALDFLAM_KEY_FILE=../../key.json \
+  node credentials.mjs
+```
+
 All of the above — rustfmt, clippy, the workspace tests, and every one of the
-seven conformance suites — runs on each push via
+eight conformance suites — runs on each push via
 [GitHub Actions](.github/workflows/ci.yml).
 
 Design, wire contracts, and the implementation map:

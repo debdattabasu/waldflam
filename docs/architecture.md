@@ -223,8 +223,55 @@ bypasses rules entirely; any other bearer must be an **unsigned JWT**
 verbatim; absent header ⇒ `request.auth == null`; malformed ⇒
 `INVALID_ARGUMENT`. The `google-cloud-resource-prefix` header *overrides* the
 database inferred from the request body and is the only way to route
-`Listen`/`Write` streams. Signature verification (against Firebase Auth JWKS
-or a configured issuer) becomes an opt-in production mode later.
+`Listen`/`Write` streams.
+
+**Verified mode** (`WALDFLAM_AUTH=verify`, `waldflam-server/src/credentials.rs`)
+replaces all of that with real signatures. Every token is RS256 and comes from
+one of three places, tried in that order:
+
+1. **waldflam's own issuer.** The deployment generates an RSA key on first
+   use, stores it in MongoDB so every instance shares it, and publishes the
+   public half at `/.well-known/jwks.json` with OIDC discovery alongside.
+   Tokens it mints carry a `wf_typ` claim — `access`, `id`, or `refresh` —
+   inside the signature, which is what keeps the kinds from being
+   interchangeable: a user's ID token presented where an access token goes is
+   rejected on its kind, not on its shape.
+2. **A registered service account's own assertion.** waldflam holds only the
+   public half; the private key is emitted once, in a Google-shaped key file,
+   and never stored. Two flows are accepted because the Google auth libraries
+   disagree about which they use (Go honours the key file's `token_uri`; the
+   Node libraries hardcode Google's): the OAuth2 JWT-bearer grant at
+   `/oauth2/v4/token`, and the assertion sent directly as the bearer.
+   Assertions are capped at a one-hour lifetime, or a signed credential
+   becomes a bearer secret with extra steps.
+3. **A configured external issuer** (`WALDFLAM_AUTH_{ISSUER,AUDIENCE,JWKS_URL}`),
+   for a deployment keeping Firebase Auth while it migrates. All three or
+   none — a half-configured verifier rejects every token from an issuer the
+   operator believes is working.
+
+Admin is a service account: named, expiring, revocable, and confined to one
+project. Revocation is re-checked on every request behind a 30-second cache,
+so it reaches access tokens already handed out — the alternative, checking
+only at mint time, would leave a leaked credential live until it expired.
+`Bearer owner` and unsigned tokens are not accepted in this mode at all.
+`WALDFLAM_ADMIN_TOKEN` remains as a shared-secret admin and is documented as
+the weaker option, because it names nobody and never expires.
+
+**Project confinement.** A credential carries the project it was issued for,
+and `Authorization::for_project` narrows it at the two places that know which
+database is being touched: rules enforcement (`rules.rs`, covering every
+client path) and the admin API (`rest.rs`, project in the URL). A mismatch
+becomes anonymous rather than an error, so rules decide and deny by default.
+Without this, one tenant's identity would authenticate against another's data
+in a multi-project deployment.
+
+**User identities** come from the Firebase flow: a service account mints a
+custom token for a `uid` (`aud` = the identitytoolkit audience), the client
+trades it at `/v1/accounts:signInWithCustomToken`, and waldflam signs the ID
+token. Custom claims ride into `request.auth.token`; the claims waldflam sets
+itself are reserved and a custom token trying to set them is rejected.
+`/v1/token` refreshes. This is what makes verified mode self-hosted: no
+identity provider is required behind it.
 
 ## 4. What clients do NOT need (scope savings)
 
@@ -358,8 +405,10 @@ engine dependencies.
 ## 8. Conformance strategy
 
 Correctness is defined by *official clients working unchanged*, not by our own
-tests agreeing with themselves. Seven suites run against a single live server
-(`conformance/`), each driving a real SDK over its real transport:
+tests agreeing with themselves. Eight suites run against a live server
+(`conformance/`), each driving a real SDK over its real transport — seven
+against one server in emulator mode, plus credentials against a second in
+verified mode:
 
 | Suite | Client | Transport | Covers |
 |---|---|---|---|
@@ -370,6 +419,7 @@ tests agreeing with themselves. Seven suites run against a single live server
 | `conformance/js` `browser.mjs` | `firebase` (browser build) | WebChannel + REST | the full suite over the closure wire protocol |
 | `conformance/js` `rules.mjs` | `firebase` + admin API | mixed | admin bypass, anonymous/owner allow+deny, `exists()` in rules, `list` enforcement, clear-data |
 | `conformance/js` `triggers.mjs` | `firebase` + local HTTP runtime | mixed | create/update/delete CloudEvents, before/after payloads, path params, non-matching paths |
+| `conformance/js` `credentials.mjs` | `fetch()` + `node:crypto` | REST, **verified mode** | OIDC discovery + JWKS, OAuth2 JWT-bearer exchange, assertion-as-bearer, admin API gating, custom token → ID token, custom claims in rules, refresh, no `owner`/unsigned backdoor |
 
 Run them with a server up (`docker compose up -d && cargo run --bin waldflam`);
 each prints `ALL … CHECKS PASSED`. Plus `cargo test --workspace` for the unit
@@ -407,6 +457,8 @@ Where the design lives in the code:
 | Rules binding + enforcement | `waldflam-server/src/rules.rs` |
 | Trigger registry + dispatcher | `waldflam-server/src/functions.rs` |
 | Auth: emulator semantics + verified mode | `waldflam-server/src/auth.rs` |
+| Service accounts, token minting, JWKS | `waldflam-server/src/credentials.rs` |
+| Credential records (accounts, signing key) | `waldflam-engine/src/credentials.rs` |
 
 Four things the design didn't anticipate, three found by running real clients
 and one by measuring query plans:

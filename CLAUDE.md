@@ -16,6 +16,9 @@ rules-engine spec (§7), roadmap (§9), and the behavior contracts (§11).
   encoding, rules semantics, auth, and limits, §11's specs are authoritative.
 - Server errors must use the exact gRPC codes clients act on (`ABORTED` for
   transaction contention, `NOT_FOUND` vs `INVALID_ARGUMENT`, etc. — §3).
+- Emulator-mode auth semantics are a wire contract, not a convenience: don't
+  loosen them (e.g. accepting signed tokens there) to make something easier.
+  Signature verification belongs in verified mode.
 
 ## Build & test
 
@@ -35,11 +38,12 @@ Protoc and Rust stable are required; protos are vendored in
 - `crates/waldflam-proto` — tonic/prost codegen for `google.firestore.v1`
 - `crates/waldflam-engine` — Firestore semantics on MongoDB: resource paths
   (`path.rs`), the cross-type value total order (`order.rs`, must match the
-  client comparators exactly — tests encode the ordering matrix), storage &
-  query planning (to come)
+  client comparators exactly — tests encode the ordering matrix), storage
+  (`store.rs`) and query planning (`plan.rs`, `query.rs`)
 - `crates/waldflam-rules` — Security Rules engine (from scratch; spec in §7)
 - `crates/waldflam-server` — the `waldflam` binary: Firestore gRPC service
-  (`service.rs`), emulator-semantics auth (`auth.rs`)
+  (`service.rs`), auth policy (`auth.rs`), service accounts and token issuing
+  (`credentials.rs`)
 
 ## Conventions
 

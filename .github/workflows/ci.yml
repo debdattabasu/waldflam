@@ -120,6 +120,31 @@ jobs:
         working-directory: conformance/js
         run: node triggers.mjs
 
+      # The credentials suite needs signatures to actually be checked, which
+      # every suite above deliberately turns off. So it gets its own server in
+      # verified mode, on its own port, plus a service account to present.
+      - name: Start waldflam in verified mode
+        run: |
+          ./target/debug/waldflam credentials create ci --project cred-ci --out key.json
+          nohup ./target/debug/waldflam > verify.log 2>&1 &
+          for _ in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/8099) >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "verifying server never came up"; cat verify.log; exit 1
+        env:
+          WALDFLAM_LISTEN: 127.0.0.1:8099
+          WALDFLAM_PUBLIC_URL: http://127.0.0.1:8099
+          WALDFLAM_MONGO: mongodb://127.0.0.1:27017/?directConnection=true
+          WALDFLAM_AUTH: verify
+
+      - name: Credentials (verified mode)
+        working-directory: conformance/js
+        run: node credentials.mjs
+        env:
+          WALDFLAM_PORT: 8099
+          WALDFLAM_KEY_FILE: ${{ github.workspace }}/key.json
+
       - name: Server log
         if: failure()
-        run: cat server.log
+        run: cat server.log verify.log 2>/dev/null || cat server.log
