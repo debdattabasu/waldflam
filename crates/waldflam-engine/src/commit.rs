@@ -6,11 +6,15 @@
 //! equality (so `1` deduplicates against `1.0`); all `serverTimestamp`s in
 //! one commit share the request time.
 //!
-//! TODO(M2): run the whole commit inside a Mongo transaction; today writes
-//! are validated together but persisted sequentially.
+//! The whole commit — the reads that preconditions are checked against and
+//! every resulting write — runs inside one MongoDB transaction, so a batch
+//! either lands completely or not at all, and a concurrent writer touching
+//! the same document forces a restart instead of a lost update.
 
 use std::collections::HashMap;
 
+use mongodb::error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT};
+use mongodb::options::WriteConcern;
 use waldflam_proto::v1::document_transform::FieldTransform;
 use waldflam_proto::v1::document_transform::field_transform::TransformType;
 use waldflam_proto::v1::precondition::ConditionType;
@@ -49,10 +53,68 @@ struct DocState {
     dirty: bool,
 }
 
-/// Applies a `Commit`'s writes atomically-in-spirit: all preconditions are
-/// checked against the evolving in-memory state before anything persists.
+/// Restarts allowed when MongoDB reports a transient transaction error — a
+/// write conflict with a concurrent commit on the same document. Exhausting
+/// them is reported as contention, which is what clients retry on.
+const MAX_TRANSACTION_ATTEMPTS: u32 = 10;
+
+/// Bounds the commit-only retry taken when the transaction's outcome is
+/// unknown (the server may already have committed).
+const MAX_COMMIT_ATTEMPTS: u32 = 3;
+
+/// Applies a `Commit`'s writes atomically: preconditions are checked against
+/// the evolving in-memory state, and the reads behind them plus every
+/// resulting write share one MongoDB transaction.
 pub async fn apply_commit(
     store: &Store,
+    database: &DatabaseName,
+    writes: &[Write],
+    now_us: i64,
+) -> Result<CommitApplied, EngineError> {
+    let mut session = store.start_session().await?;
+    for attempt in 0..MAX_TRANSACTION_ATTEMPTS {
+        session.start_transaction().write_concern(WriteConcern::majority()).await?;
+        let applied =
+            match apply_in_transaction(store, &mut session, database, writes, now_us).await {
+                Ok(applied) => applied,
+                Err(error) => {
+                    // Best effort: an un-aborted transaction expires server-side.
+                    let _ = session.abort_transaction().await;
+                    if is_transient(&error) {
+                        backoff(attempt).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+        match commit_transaction(&mut session).await {
+            Ok(()) => return Ok(applied),
+            Err(error) if is_transient(&error) => backoff(attempt).await,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(EngineError::Aborted)
+}
+
+/// Spreads out contenders before restarting a conflicted transaction.
+/// Without it, writers racing on one document collide repeatedly: each
+/// restarts the instant it loses, straight into the others doing the same.
+/// Full jitter over an exponentially growing window, seeded from the clock
+/// so concurrent tasks land on different delays without pulling in an RNG.
+async fn backoff(attempt: u32) {
+    let ceiling_ms = 2u64 << attempt.min(6); // 2ms … 128ms
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos() as u64)
+        .unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_millis(jitter % ceiling_ms)).await;
+}
+
+/// One attempt: everything here runs against `session`'s transaction and is
+/// discarded wholesale if it aborts.
+async fn apply_in_transaction(
+    store: &Store,
+    session: &mut mongodb::ClientSession,
     database: &DatabaseName,
     writes: &[Write],
     now_us: i64,
@@ -63,7 +125,7 @@ pub async fn apply_commit(
         let path = write_target(database, write)?;
         let key = path.to_string();
         if let std::collections::hash_map::Entry::Vacant(e) = states.entry(key) {
-            let loaded = store.get_document(database, &path).await?;
+            let loaded = store.get_document_in_session(session, database, &path).await?;
             let current =
                 loaded.as_ref().map(|d| (d.create_time_us, d.update_time_us, d.fields.clone()));
             e.insert(DocState { current, before: loaded, dirty: false });
@@ -91,16 +153,41 @@ pub async fn apply_commit(
         let before = state.before.clone();
         match &state.current {
             Some((_, _, fields)) => {
-                let stored = store.set_document(database, &path, fields.clone(), now_us).await?;
+                let stored = store
+                    .set_document_in_session(session, database, &path, fields.clone(), now_us)
+                    .await?;
                 changes.push(crate::watch::DocumentDelta { path, before, after: Some(stored) });
             }
             None => {
-                store.delete_document(database, &path).await?;
+                store.delete_document_in_session(session, database, &path).await?;
                 changes.push(crate::watch::DocumentDelta { path, before, after: None });
             }
         }
     }
     Ok(CommitApplied { outcomes, changes })
+}
+
+/// Commits, retrying the commit alone while its outcome is unknown — a blip
+/// after the server may already have applied it. Retrying is safe: MongoDB
+/// treats a repeat commit of an already-committed transaction as a no-op.
+async fn commit_transaction(session: &mut mongodb::ClientSession) -> Result<(), EngineError> {
+    let mut last = None;
+    for _ in 0..MAX_COMMIT_ATTEMPTS {
+        match session.commit_transaction().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) => {
+                last = Some(error);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(last.map(EngineError::from).unwrap_or(EngineError::Aborted))
+}
+
+/// A write conflict with a concurrent commit: MongoDB labels these
+/// retryable, and re-running the whole transaction is the prescribed fix.
+fn is_transient(error: &EngineError) -> bool {
+    matches!(error, EngineError::Mongo(e) if e.contains_label(TRANSIENT_TRANSACTION_ERROR))
 }
 
 fn write_target(database: &DatabaseName, write: &Write) -> Result<ResourcePath, EngineError> {

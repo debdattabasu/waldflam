@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use mongodb::bson::spec::BinarySubtype;
 use mongodb::bson::{Binary, doc, to_bson};
 use mongodb::options::ReturnDocument;
-use mongodb::{Client, Collection, Database};
+use mongodb::{Client, ClientSession, Collection, Database};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use waldflam_proto::v1::value::ValueType;
@@ -76,12 +76,43 @@ impl Store {
         self.db.collection(&format!("{}~{}", database.project_id, database.database_id))
     }
 
+    /// A session for running a multi-document transaction (the commit path).
+    pub async fn start_session(&self) -> Result<ClientSession, EngineError> {
+        Ok(self.db.client().start_session().await?)
+    }
+
     pub async fn get_document(
         &self,
         database: &DatabaseName,
         path: &ResourcePath,
     ) -> Result<Option<StoredDocument>, EngineError> {
-        let row = self.collection(database).find_one(doc! { "_id": path.to_string() }).await?;
+        self.get_document_opt(None, database, path).await
+    }
+
+    /// As `get_document`, but reading inside `session`'s transaction so the
+    /// commit path validates preconditions against the same snapshot it
+    /// writes to.
+    pub async fn get_document_in_session(
+        &self,
+        session: &mut ClientSession,
+        database: &DatabaseName,
+        path: &ResourcePath,
+    ) -> Result<Option<StoredDocument>, EngineError> {
+        self.get_document_opt(Some(session), database, path).await
+    }
+
+    async fn get_document_opt(
+        &self,
+        session: Option<&mut ClientSession>,
+        database: &DatabaseName,
+        path: &ResourcePath,
+    ) -> Result<Option<StoredDocument>, EngineError> {
+        let collection = self.collection(database);
+        let find = collection.find_one(doc! { "_id": path.to_string() });
+        let row = match session {
+            Some(session) => find.session(session).await?,
+            None => find.await?,
+        };
         row.map(decode_row).transpose()
     }
 
@@ -90,6 +121,30 @@ impl Store {
     /// the commit path.
     pub async fn set_document(
         &self,
+        database: &DatabaseName,
+        path: &ResourcePath,
+        fields: HashMap<String, Value>,
+        now_us: i64,
+    ) -> Result<StoredDocument, EngineError> {
+        self.set_document_opt(None, database, path, fields, now_us).await
+    }
+
+    /// As `set_document`, but written inside `session`'s transaction so the
+    /// whole commit lands or none of it does.
+    pub async fn set_document_in_session(
+        &self,
+        session: &mut ClientSession,
+        database: &DatabaseName,
+        path: &ResourcePath,
+        fields: HashMap<String, Value>,
+        now_us: i64,
+    ) -> Result<StoredDocument, EngineError> {
+        self.set_document_opt(Some(session), database, path, fields, now_us).await
+    }
+
+    async fn set_document_opt(
+        &self,
+        session: Option<&mut ClientSession>,
         database: &DatabaseName,
         path: &ResourcePath,
         fields: HashMap<String, Value>,
@@ -112,14 +167,16 @@ impl Store {
             },
             "$setOnInsert": { "create_time_us": now_us },
         };
-        let row = self
-            .collection(database)
+        let collection = self.collection(database);
+        let update = collection
             .find_one_and_update(doc! { "_id": path.to_string() }, update)
             .upsert(true)
-            .return_document(ReturnDocument::After)
-            .await?
-            .expect("upsert returns a document");
-        decode_row(row)
+            .return_document(ReturnDocument::After);
+        let row = match session {
+            Some(session) => update.session(session).await?,
+            None => update.await?,
+        };
+        decode_row(row.expect("upsert returns a document"))
     }
 
     /// All documents in one collection (unsorted; callers order).
@@ -194,7 +251,31 @@ impl Store {
         database: &DatabaseName,
         path: &ResourcePath,
     ) -> Result<bool, EngineError> {
-        let result = self.collection(database).delete_one(doc! { "_id": path.to_string() }).await?;
+        self.delete_document_opt(None, database, path).await
+    }
+
+    /// As `delete_document`, but inside `session`'s transaction.
+    pub async fn delete_document_in_session(
+        &self,
+        session: &mut ClientSession,
+        database: &DatabaseName,
+        path: &ResourcePath,
+    ) -> Result<bool, EngineError> {
+        self.delete_document_opt(Some(session), database, path).await
+    }
+
+    async fn delete_document_opt(
+        &self,
+        session: Option<&mut ClientSession>,
+        database: &DatabaseName,
+        path: &ResourcePath,
+    ) -> Result<bool, EngineError> {
+        let collection = self.collection(database);
+        let delete = collection.delete_one(doc! { "_id": path.to_string() });
+        let result = match session {
+            Some(session) => delete.session(session).await?,
+            None => delete.await?,
+        };
         Ok(result.deleted_count > 0)
     }
 }
