@@ -1,8 +1,8 @@
 //! Order-preserving index-key encodings.
 //!
-//! Numbers use the ordered-number format documented in
-//! docs/architecture.md §6/§11 (reimplemented from the behavioral spec, not
-//! ported code): a number decomposes into sign / binary exponent / 64-bit
+//! Numbers use the ordered-number format specified in
+//! docs/architecture.md §6/§11: a number decomposes into sign / binary
+//! exponent / 64-bit
 //! left-justified fraction-after-the-leading-1, then serializes into ≤11
 //! prefix-free bytes whose unsigned lexicographic order equals numeric order
 //! across the whole real line — int64 and double interleave exactly, and
