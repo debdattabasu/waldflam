@@ -23,6 +23,40 @@ impl FirestoreService {
         Self { store, txns: Default::default(), hub: Default::default() }
     }
 
+    /// Applies one write through the commit machinery (preconditions, watch
+    /// fan-out) and returns the resulting document (empty for deletes).
+    async fn apply_single_write(
+        &self,
+        name: &ResourceName,
+        write: Write,
+    ) -> Result<Response<Document>, Status> {
+        let now = now_us();
+        let guard = self.txns.commit_lock.lock().await;
+        let applied = waldflam_engine::commit::apply_commit(
+            &self.store,
+            &name.database,
+            std::slice::from_ref(&write),
+            now,
+        )
+        .await
+        .map_err(engine_status)?;
+        drop(guard);
+        let result = applied
+            .changes
+            .iter()
+            .find(|(p, _)| *p == name.path)
+            .and_then(|(_, doc)| doc.clone());
+        self.hub.publish(waldflam_engine::watch::CommitEvent {
+            database: name.database.clone(),
+            changes: applied.changes,
+            commit_us: now,
+        });
+        Ok(Response::new(match result {
+            Some(doc) => to_wire_document(name, doc),
+            None => Document { name: name.to_string(), ..Default::default() },
+        }))
+    }
+
     fn begin_txn(&self, database: &DatabaseName, options: Option<&TransactionOptions>) -> Vec<u8> {
         let read_only = matches!(
             options.and_then(|o| o.mode.as_ref()),
@@ -31,6 +65,20 @@ impl FirestoreService {
         // ReadWrite.retry_transaction is accepted and starts fresh.
         self.txns.begin(database, read_only)
     }
+}
+
+/// Firestore-style auto id: 20 chars of [A-Za-z0-9].
+fn generate_document_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(20);
+    let mut hasher = RandomState::new().build_hasher();
+    for i in 0..20u64 {
+        hasher.write_u64(i.wrapping_add(now_us() as u64));
+        out.push(ALPHABET[(hasher.finish() % ALPHABET.len() as u64) as usize] as char);
+    }
+    out
 }
 
 pub(crate) fn now_us() -> i64 {
@@ -125,13 +173,17 @@ impl Firestore for FirestoreService {
     ) -> Result<Response<Document>, Status> {
         let req = request.into_inner();
         let not_found = || Status::not_found(format!("Document ({}) not found.", req.name));
-        let name = ResourceName::parse(&req.name)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        // A parseable name that isn't a document path (e.g. firestore-rs's
-        // `-ping-` probe) can't exist: NOT_FOUND, not INVALID_ARGUMENT.
-        if !name.path.is_document() {
-            return Err(not_found());
-        }
+        // Anything with a valid database prefix that isn't a document path
+        // (e.g. firestore-rs's ping probe) can't exist: NOT_FOUND, not
+        // INVALID_ARGUMENT — clients treat the latter as fatal.
+        let name = match ResourceName::parse(&req.name) {
+            Ok(name) if name.path.is_document() => name,
+            Ok(_) => return Err(not_found()),
+            Err(_) if DatabaseName::parse_prefix(&req.name).is_ok() => {
+                return Err(not_found());
+            }
+            Err(e) => return Err(Status::invalid_argument(e.to_string())),
+        };
         // TODO(consistency): honor read_time (reads see latest state).
         let doc = self
             .store
@@ -146,6 +198,36 @@ impl Firestore for FirestoreService {
         }
         let doc = doc.ok_or_else(not_found)?;
         Ok(Response::new(to_wire_document(&name, doc)))
+    }
+
+    async fn create_document(
+        &self,
+        request: Request<CreateDocumentRequest>,
+    ) -> Result<Response<Document>, Status> {
+        let req = request.into_inner();
+        let parent = ResourceName::parse(&req.parent)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let document_id = if req.document_id.is_empty() {
+            generate_document_id()
+        } else {
+            req.document_id.clone()
+        };
+        let path = parent
+            .path
+            .child(&req.collection_id)
+            .and_then(|c| c.child(&document_id))
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let name = ResourceName { database: parent.database, path };
+        let mut doc = req.document.unwrap_or_default();
+        doc.name = name.to_string();
+        let write = Write {
+            operation: Some(write::Operation::Update(doc)),
+            current_document: Some(Precondition {
+                condition_type: Some(precondition::ConditionType::Exists(false)),
+            }),
+            ..Default::default()
+        };
+        self.apply_single_write(&name, write).await
     }
 
     async fn list_documents(
@@ -192,16 +274,35 @@ impl Firestore for FirestoreService {
 
     async fn update_document(
         &self,
-        _request: Request<UpdateDocumentRequest>,
+        request: Request<UpdateDocumentRequest>,
     ) -> Result<Response<Document>, Status> {
-        Err(Status::unimplemented("UpdateDocument"))
+        let req = request.into_inner();
+        let doc = req.document.unwrap_or_default();
+        let name = ResourceName::parse_document(&doc.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let write = Write {
+            operation: Some(write::Operation::Update(doc)),
+            update_mask: req.update_mask,
+            current_document: req.current_document,
+            ..Default::default()
+        };
+        self.apply_single_write(&name, write).await
     }
 
     async fn delete_document(
         &self,
-        _request: Request<DeleteDocumentRequest>,
+        request: Request<DeleteDocumentRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("DeleteDocument"))
+        let req = request.into_inner();
+        let name = ResourceName::parse_document(&req.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let write = Write {
+            operation: Some(write::Operation::Delete(req.name)),
+            current_document: req.current_document,
+            ..Default::default()
+        };
+        self.apply_single_write(&name, write).await?;
+        Ok(Response::new(()))
     }
 
     async fn batch_get_documents(
@@ -400,9 +501,39 @@ impl Firestore for FirestoreService {
 
     async fn run_aggregation_query(
         &self,
-        _request: Request<RunAggregationQueryRequest>,
+        request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<Self::RunAggregationQueryStream>, Status> {
-        Err(Status::unimplemented("RunAggregationQuery"))
+        let req = request.into_inner();
+        let parent = ResourceName::parse(&req.parent)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let Some(run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query)) =
+            req.query_type
+        else {
+            return Err(Status::invalid_argument("missing structured_aggregation_query"));
+        };
+        let Some(structured_aggregation_query::QueryType::StructuredQuery(query)) =
+            agg_query.query_type
+        else {
+            return Err(Status::invalid_argument("missing underlying structured_query"));
+        };
+        // TODO(consistency): transaction / read_time selectors.
+        let docs =
+            waldflam_engine::query::run_query(&self.store, &parent.database, &parent.path, &query)
+                .await
+                .map_err(engine_status)?;
+        let results = waldflam_engine::query::aggregate(&docs, &agg_query.aggregations)
+            .map_err(engine_status)?;
+
+        // One response carrying every aggregate satisfies all SDK contracts
+        // (JS asserts exactly one result; Go merges across responses).
+        let response = RunAggregationQueryResponse {
+            result: Some(AggregationResult {
+                aggregate_fields: results.into_iter().collect(),
+            }),
+            read_time: Some(timestamp_from_us(now_us())),
+            ..Default::default()
+        };
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(response)]))))
     }
 
     async fn execute_pipeline(
@@ -537,10 +668,4 @@ impl Firestore for FirestoreService {
         Err(Status::unimplemented("BatchWrite"))
     }
 
-    async fn create_document(
-        &self,
-        _request: Request<CreateDocumentRequest>,
-    ) -> Result<Response<Document>, Status> {
-        Err(Status::unimplemented("CreateDocument"))
-    }
 }

@@ -19,7 +19,7 @@ use waldflam_proto::v1::structured_query::filter::FilterType;
 use waldflam_proto::v1::structured_query::unary_filter::{OperandType, Operator as UnaryOp};
 use waldflam_proto::v1::structured_query::{Direction, FieldReference, Filter, Order};
 use waldflam_proto::v1::value::ValueType;
-use waldflam_proto::v1::{Cursor, StructuredQuery, Value};
+use waldflam_proto::v1::{Cursor, StructuredQuery, Value, structured_aggregation_query};
 
 use crate::EngineError;
 use crate::fields::get_field;
@@ -97,6 +97,98 @@ pub async fn run_query(
         docs.truncate(limit.max(0) as usize);
     }
     Ok(docs)
+}
+
+/// Computes aggregation results over an already-evaluated result set.
+///
+/// Semantics: `count` caps at `up_to`; `sum`/`avg` consider only numeric
+/// values (missing/non-numeric fields are skipped, not zero); an integer sum
+/// stays int64 until a double appears or it overflows, then promotes; any
+/// NaN poisons the result; empty sum = int 0, empty avg = null.
+pub fn aggregate(
+    docs: &[StoredDocument],
+    aggregations: &[structured_aggregation_query::Aggregation],
+) -> Result<Vec<(String, Value)>, EngineError> {
+    use structured_aggregation_query::aggregation::Operator;
+    let mut out = Vec::with_capacity(aggregations.len());
+    for (i, agg) in aggregations.iter().enumerate() {
+        let alias = if agg.alias.is_empty() {
+            format!("field_{i}")
+        } else {
+            agg.alias.clone()
+        };
+        let value = match agg.operator.as_ref() {
+            Some(Operator::Count(count)) => {
+                let mut n = docs.len() as i64;
+                if let Some(up_to) = count.up_to {
+                    n = n.min(up_to);
+                }
+                Value { value_type: Some(ValueType::IntegerValue(n)) }
+            }
+            Some(Operator::Sum(sum)) => {
+                let field = sum.field.as_ref().map(|f| f.field_path.as_str()).unwrap_or("");
+                numeric_fold(docs, field).into_sum()
+            }
+            Some(Operator::Avg(avg)) => {
+                let field = avg.field.as_ref().map(|f| f.field_path.as_str()).unwrap_or("");
+                numeric_fold(docs, field).into_avg()
+            }
+            None => {
+                return Err(EngineError::InvalidArgument(
+                    "aggregation has no operator".into(),
+                ));
+            }
+        };
+        out.push((alias, value));
+    }
+    Ok(out)
+}
+
+struct NumericFold {
+    int_sum: Option<i64>,
+    double_sum: f64,
+    count: i64,
+    seen_double: bool,
+}
+
+fn numeric_fold(docs: &[StoredDocument], field: &str) -> NumericFold {
+    let mut fold = NumericFold { int_sum: Some(0), double_sum: 0.0, count: 0, seen_double: false };
+    for doc in docs {
+        match get_field(&doc.fields, field).and_then(|v| v.value_type.as_ref()) {
+            Some(ValueType::IntegerValue(i)) => {
+                fold.count += 1;
+                fold.double_sum += *i as f64;
+                fold.int_sum = fold.int_sum.and_then(|s| s.checked_add(*i));
+            }
+            Some(ValueType::DoubleValue(d)) => {
+                fold.count += 1;
+                fold.seen_double = true;
+                fold.double_sum += d;
+            }
+            _ => {}
+        }
+    }
+    fold
+}
+
+impl NumericFold {
+    fn into_sum(self) -> Value {
+        let vt = match (self.seen_double, self.int_sum) {
+            // All ints, no overflow: stays an integer.
+            (false, Some(s)) => ValueType::IntegerValue(s),
+            _ => ValueType::DoubleValue(self.double_sum),
+        };
+        Value { value_type: Some(vt) }
+    }
+
+    fn into_avg(self) -> Value {
+        let vt = if self.count == 0 {
+            ValueType::NullValue(0)
+        } else {
+            ValueType::DoubleValue(self.double_sum / self.count as f64)
+        };
+        Value { value_type: Some(vt) }
+    }
 }
 
 fn flatten_and<'a>(

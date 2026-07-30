@@ -97,6 +97,7 @@ func main() {
 
 	runTransactionChecks(ctx, client)
 	runListenChecks(ctx, client)
+	runAggregationChecks(ctx, client)
 
 	fmt.Println("ALL GO CLIENT CHECKS PASSED")
 	os.Exit(0)
