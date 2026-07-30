@@ -30,6 +30,23 @@ pub struct RestState {
     pub triggers: std::sync::Arc<crate::functions::TriggerRegistry>,
 }
 
+/// Carries the caller's credentials into the gRPC request the service sees.
+///
+/// Without this the REST surface authenticates as nobody: the service reads
+/// `authorization` from request metadata, and a `tonic::Request` built from a
+/// message alone has none — so a signed-in user's rules would evaluate with
+/// `request.auth == null`, and `Bearer owner` would not grant admin.
+fn authed<T>(message: T, headers: &HeaderMap) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(value) = headers.get(header::AUTHORIZATION)
+        && let Ok(text) = value.to_str()
+        && let Ok(metadata) = text.parse()
+    {
+        request.metadata_mut().insert("authorization", metadata);
+    }
+    request
+}
+
 pub fn descriptor_pool() -> DescriptorPool {
     DescriptorPool::decode(waldflam_proto::FILE_DESCRIPTOR_SET)
         .expect("embedded descriptors decode")
@@ -39,9 +56,10 @@ pub fn descriptor_pool() -> DescriptorPool {
 pub async fn v1_post(
     State(state): State<RestState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match dispatch(&state, &path, &body).await {
+    match dispatch(&state, &path, &body, &headers).await {
         Ok(json) => {
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response()
         }
@@ -49,7 +67,12 @@ pub async fn v1_post(
     }
 }
 
-async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, Status> {
+async fn dispatch(
+    state: &RestState,
+    path: &str,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Result<String, Status> {
     let (resource, method) =
         path.rsplit_once(':').ok_or_else(|| Status::not_found("unknown REST path"))?;
     let body = if body.is_empty() { b"{}" } else { body };
@@ -59,37 +82,35 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
             let mut req: CommitRequest =
                 json_to_message(state, "google.firestore.v1.CommitRequest", body)?;
             req.database = database_of(resource)?;
-            let resp = state.svc.commit(tonic::Request::new(req)).await?;
+            let resp = state.svc.commit(authed(req, headers)).await?;
             message_to_json(state, "google.firestore.v1.CommitResponse", &resp.into_inner())
         }
         "batchGet" => {
             let mut req: BatchGetDocumentsRequest =
                 json_to_message(state, "google.firestore.v1.BatchGetDocumentsRequest", body)?;
             req.database = database_of(resource)?;
-            let stream =
-                state.svc.batch_get_documents(tonic::Request::new(req)).await?.into_inner();
+            let stream = state.svc.batch_get_documents(authed(req, headers)).await?.into_inner();
             collect_json(state, "google.firestore.v1.BatchGetDocumentsResponse", stream).await
         }
         "runQuery" => {
             let mut req: RunQueryRequest =
                 json_to_message(state, "google.firestore.v1.RunQueryRequest", body)?;
             req.parent = resource.to_owned();
-            let stream = state.svc.run_query(tonic::Request::new(req)).await?.into_inner();
+            let stream = state.svc.run_query(authed(req, headers)).await?.into_inner();
             collect_json(state, "google.firestore.v1.RunQueryResponse", stream).await
         }
         "runAggregationQuery" => {
             let mut req: RunAggregationQueryRequest =
                 json_to_message(state, "google.firestore.v1.RunAggregationQueryRequest", body)?;
             req.parent = resource.to_owned();
-            let stream =
-                state.svc.run_aggregation_query(tonic::Request::new(req)).await?.into_inner();
+            let stream = state.svc.run_aggregation_query(authed(req, headers)).await?.into_inner();
             collect_json(state, "google.firestore.v1.RunAggregationQueryResponse", stream).await
         }
         "beginTransaction" => {
             let mut req: BeginTransactionRequest =
                 json_to_message(state, "google.firestore.v1.BeginTransactionRequest", body)?;
             req.database = database_of(resource)?;
-            let resp = state.svc.begin_transaction(tonic::Request::new(req)).await?;
+            let resp = state.svc.begin_transaction(authed(req, headers)).await?;
             message_to_json(
                 state,
                 "google.firestore.v1.BeginTransactionResponse",
@@ -100,7 +121,7 @@ async fn dispatch(state: &RestState, path: &str, body: &[u8]) -> Result<String, 
             let mut req: RollbackRequest =
                 json_to_message(state, "google.firestore.v1.RollbackRequest", body)?;
             req.database = database_of(resource)?;
-            state.svc.rollback(tonic::Request::new(req)).await?;
+            state.svc.rollback(authed(req, headers)).await?;
             Ok("{}".into())
         }
         _ => Err(Status::not_found(format!("unknown REST method {method:?}"))),

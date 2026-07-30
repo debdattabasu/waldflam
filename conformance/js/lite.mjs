@@ -41,5 +41,41 @@ snap = await getDoc(doc(db, 'cities/tokyo'));
 assert(!snap.exists(), 'delete');
 console.log('LITE DELETE ok');
 
+// Rules over REST. The lite SDK sends credentials as an Authorization header
+// on plain fetch() calls; the server has to carry them into the request it
+// authorizes, or every REST call silently evaluates as `request.auth == null`
+// no matter who is signed in.
+const rulesProject = `js-lite-rules-${Date.now()}`;
+const res = await fetch(`http://${host}:${port}/emulator/v1/projects/${rulesProject}:securityRules`, {
+  method: 'PUT',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ rules: { files: [{ name: 'f.rules', content: `
+    rules_version = '2';
+    service cloud.firestore {
+      match /databases/{db}/documents {
+        match /{document=**} { allow read, write: if request.auth != null; }
+      }
+    }` }] } }),
+});
+assert(res.ok, `load rules: ${res.status}`);
+
+const signedIn = getFirestore(initializeApp({ projectId: rulesProject }, 'lite-user'));
+connectFirestoreEmulator(signedIn, host, port, { mockUserToken: { sub: 'alice', user_id: 'alice' } });
+await setDoc(doc(signedIn, 'private/a'), { ok: true });
+snap = await getDoc(doc(signedIn, 'private/a'));
+assert(snap.exists() && snap.data().ok === true, 'signed-in REST write/read should be allowed');
+console.log('LITE RULES ok: signed-in request is authorized');
+
+const anonymous = getFirestore(initializeApp({ projectId: rulesProject }, 'lite-anon'));
+connectFirestoreEmulator(anonymous, host, port);
+let denied = false;
+try {
+  await getDoc(doc(anonymous, 'private/a'));
+} catch (e) {
+  denied = String(e).includes('permission') || String(e).includes('PERMISSION_DENIED');
+}
+assert(denied, 'anonymous REST read should be denied');
+console.log('LITE RULES ok: anonymous request is denied');
+
 console.log('ALL JS LITE CHECKS PASSED');
 process.exit(0);
