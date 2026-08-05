@@ -68,6 +68,26 @@ const REFRESH_TOKENS: &str = "_refresh_tokens";
 /// Per-user revocation state.
 const IDENTITIES: &str = "_identities";
 
+/// One-shot assertions already spent, so they cannot be spent again.
+const USED_ASSERTIONS: &str = "_used_assertions";
+
+/// A one-shot assertion that has been redeemed.
+///
+/// Kept in MongoDB rather than in memory because replay protection that only
+/// covers one instance is not replay protection: an attacker would simply
+/// present the captured assertion to a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsedAssertion {
+    /// Hash of issuer + `jti`. `jti` is only unique per issuer, so the
+    /// issuer has to be part of the key.
+    #[serde(rename = "_id")]
+    pub id: String,
+    /// TTL anchor, set to when the assertion expires: past that the
+    /// signature is refused on its own and the record has nothing left to
+    /// protect.
+    pub expires_at: mongodb::bson::DateTime,
+}
+
 /// One issued refresh token.
 ///
 /// Stored rather than self-describing, which is the whole point: a signed
@@ -339,6 +359,35 @@ impl Store {
         uid: &str,
     ) -> Result<Option<Identity>, EngineError> {
         Ok(self.identities().find_one(doc! { "_id": identity_key(project_id, uid) }).await?)
+    }
+
+    /// Spends a one-shot assertion, returning `false` if it was already
+    /// spent.
+    ///
+    /// The uniqueness of `_id` is what makes this safe under concurrency:
+    /// two instances racing the same replayed assertion both attempt the
+    /// insert and exactly one wins, with no read-then-write window for the
+    /// other to slip through.
+    pub async fn claim_assertion(
+        &self,
+        id: &str,
+        expires_at: mongodb::bson::DateTime,
+    ) -> Result<bool, EngineError> {
+        let used: Collection<UsedAssertion> = self.db().collection(USED_ASSERTIONS);
+        let ttl = mongodb::IndexModel::builder()
+            .keys(doc! { "expires_at": 1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(std::time::Duration::from_secs(0))
+                    .build(),
+            )
+            .build();
+        used.create_index(ttl).await?;
+        match used.insert_one(UsedAssertion { id: id.to_owned(), expires_at }).await {
+            Ok(_) => Ok(true),
+            Err(error) if is_duplicate_key(&error) => Ok(false),
+            Err(error) => Err(EngineError::Mongo(error)),
+        }
     }
 
     fn credential_events(&self) -> Collection<CredentialEvent> {

@@ -112,6 +112,28 @@ assert(badGrant.status === 400, 'a bad assertion must not be exchanged');
 assert((await badGrant.json()).error === 'invalid_grant', 'OAuth2 error shape');
 console.log('CRED EXCHANGE ok: a forged assertion is refused');
 
+// An assertion carrying a `jti` is one-shot at this endpoint: capturing one
+// in flight must not buy a second access token.
+const nonced = signJwt({
+  iss: keyFile.client_email,
+  sub: keyFile.client_email,
+  aud: keyFile.token_uri,
+  iat: now(),
+  exp: now() + 600,
+  jti: `conformance-${Date.now()}`,
+});
+const exchange = () => fetch(keyFile.token_uri, {
+  method: 'POST',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion: nonced,
+  }),
+});
+assert((await exchange()).ok, 'the first exchange of a nonced assertion works');
+assert((await exchange()).status === 400, 'replaying it must not buy a second token');
+console.log('CRED REPLAY ok: a spent assertion cannot be exchanged again');
+
 // ---- the access token is admin: it can load rules, and bypass them -------
 
 const rules = `
@@ -144,9 +166,18 @@ console.log('CRED ADMIN ok: a service account bypasses security rules');
 
 // The assertion works as a bearer token directly, too — which auth library
 // versions do instead of the exchange, and a server cannot dictate which.
-const direct = await write('locked/direct', { ok: { booleanValue: true } }, assertion(base));
-assert(direct.status === 200, `a self-signed assertion must authenticate: ${direct.status}`);
-console.log('CRED ASSERTION ok: a self-signed assertion is accepted directly');
+//
+// Sent repeatedly on purpose: this flow reuses one assertion for its whole
+// lifetime, so replay protection must *not* reach it. These writes go to a
+// path rules deny outright, so a 200 can only mean the assertion
+// authenticated as admin every time.
+const reused = assertion(base);
+for (const attempt of [1, 2, 3]) {
+  const direct = await write(`locked/direct${attempt}`, { ok: { booleanValue: true } }, reused);
+  assert(direct.status === 200,
+    `a self-signed assertion must authenticate every time, attempt ${attempt}: ${direct.status}`);
+}
+console.log('CRED ASSERTION ok: a self-signed assertion is accepted directly, and reusably');
 
 // ---- a service account vouches for a user; waldflam issues the identity --
 

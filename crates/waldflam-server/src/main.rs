@@ -58,6 +58,11 @@ Environment:
                          set to 1 to check every ID token against its user's
                          revocation state, instead of trusting it until it
                          expires (costs a lookup per request)
+  WALDFLAM_AUTH_REQUIRE_JTI
+                         set to 1 to refuse one-shot assertions with no `jti`,
+                         which are the ones replay protection cannot cover.
+                         Only for deployments that control their clients — not
+                         every Google auth library sends one
   WALDFLAM_TLS_CERT      PEM certificate chain; with WALDFLAM_TLS_KEY, waldflam
   WALDFLAM_TLS_KEY       terminates TLS itself (ALPN h2 + http/1.1)
   WALDFLAM_TLS           set to `terminated` to acknowledge that something in
@@ -69,10 +74,9 @@ async fn serve() -> anyhow::Result<()> {
         std::env::var("WALDFLAM_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
     let store = waldflam_engine::store::Store::connect(&mongo_uri()).await?;
     let credentials = Arc::new(
-        Credentials::new(store.clone(), public_url()).with_revocation_checks(
-            std::env::var("WALDFLAM_AUTH_CHECK_REVOKED")
-                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
-        ),
+        Credentials::new(store.clone(), public_url())
+            .with_revocation_checks(enabled("WALDFLAM_AUTH_CHECK_REVOKED"))
+            .with_required_jti(enabled("WALDFLAM_AUTH_REQUIRE_JTI")),
     );
     let auth = auth_policy(credentials.clone())?;
     if auth.guards_admin_api() {
@@ -107,6 +111,11 @@ fn tls_config() -> anyhow::Result<Option<Arc<tokio_rustls::rustls::ServerConfig>
             "TLS needs WALDFLAM_TLS_CERT and WALDFLAM_TLS_KEY together — set both or neither"
         )),
     }
+}
+
+/// Reads a boolean switch from the environment.
+fn enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
 fn mongo_uri() -> String {

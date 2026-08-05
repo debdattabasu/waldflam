@@ -527,3 +527,116 @@ async fn another_instance_picks_up_a_rotated_key() {
         "a token naming an unfamiliar key must trigger a re-read, not a rejection"
     );
 }
+
+/// An assertion traded for an access token is spent: presenting the same one
+/// again must not buy a second token.
+#[tokio::test]
+async fn a_one_shot_assertion_cannot_be_replayed() {
+    let credentials = credentials().await;
+    let (_, key_file) =
+        credentials.create_service_account(&unique("replay"), "demo").await.expect("create");
+    let email = key_file["client_email"].as_str().expect("email");
+    let once = sign(
+        &key_file,
+        serde_json::json!({
+            "iss": email, "sub": email, "aud": ISSUER,
+            "iat": now(), "exp": now() + 600, "jti": unique("nonce"),
+        }),
+    );
+
+    assert!(credentials.exchange_assertion(&once).await.is_ok(), "first exchange works");
+    let replayed = credentials.exchange_assertion(&once).await.expect_err("replay refused");
+    assert!(replayed.message().contains("already been used"), "{}", replayed.message());
+}
+
+/// The flow that would break if replay protection were applied everywhere:
+/// a self-signed assertion is sent as a bearer token on *every* request for
+/// its whole lifetime, so it must stay usable more than once.
+#[tokio::test]
+async fn an_assertion_used_as_a_bearer_token_still_works_repeatedly() {
+    let credentials = credentials().await;
+    let (_, key_file) =
+        credentials.create_service_account(&unique("bearer"), "demo").await.expect("create");
+    let email = key_file["client_email"].as_str().expect("email");
+    let repeated = sign(
+        &key_file,
+        serde_json::json!({
+            "iss": email, "sub": email, "aud": ISSUER,
+            "iat": now(), "exp": now() + 600, "jti": unique("nonce"),
+        }),
+    );
+
+    let policy = policy(credentials);
+    for attempt in 1..=3 {
+        assert!(
+            judge(&policy, &repeated).await.is_ok(),
+            "attempt {attempt}: a bearer assertion is reused by design and must keep working"
+        );
+    }
+}
+
+/// Two service accounts choosing the same `jti` must not collide — the claim
+/// is only unique per issuer.
+#[tokio::test]
+async fn the_same_jti_from_two_issuers_does_not_collide() {
+    let credentials = credentials().await;
+    let nonce = unique("shared");
+    let mut assertions = Vec::new();
+    for label in ["issuer-a", "issuer-b"] {
+        let (_, key_file) =
+            credentials.create_service_account(&unique(label), "demo").await.expect("create");
+        let email = key_file["client_email"].as_str().expect("email").to_owned();
+        assertions.push(sign(
+            &key_file,
+            serde_json::json!({
+                "iss": email, "sub": email, "aud": ISSUER,
+                "iat": now(), "exp": now() + 600, "jti": nonce,
+            }),
+        ));
+    }
+    for assertion in &assertions {
+        assert!(
+            credentials.exchange_assertion(assertion).await.is_ok(),
+            "the same jti from a different issuer is a different assertion"
+        );
+    }
+}
+
+/// A custom token buys a session, so replaying one would mint a second.
+#[tokio::test]
+async fn a_custom_token_cannot_be_replayed() {
+    let credentials = credentials().await;
+    let (_, key_file) =
+        credentials.create_service_account(&unique("ctreplay"), "demo").await.expect("create");
+    let email = key_file["client_email"].as_str().expect("email");
+    let custom_token = sign(
+        &key_file,
+        serde_json::json!({
+            "iss": email, "sub": email, "aud": CUSTOM_TOKEN_AUDIENCE,
+            "iat": now(), "exp": now() + 600, "uid": "grace", "jti": unique("nonce"),
+        }),
+    );
+
+    assert!(credentials.sign_in_with_custom_token(&custom_token).await.is_ok());
+    assert!(
+        credentials.sign_in_with_custom_token(&custom_token).await.is_err(),
+        "a captured custom token must not mint a second session"
+    );
+}
+
+/// Without a `jti` there is nothing to track, so RFC 7523 leaves replay
+/// protection off — unless the deployment insists.
+#[tokio::test]
+async fn assertions_without_a_jti_are_allowed_unless_required() {
+    let credentials = credentials().await;
+    let (_, key_file) =
+        credentials.create_service_account(&unique("nojti"), "demo").await.expect("create");
+    let without = assertion(&key_file, ISSUER);
+    assert!(credentials.exchange_assertion(&without).await.is_ok(), "permitted by default");
+
+    let strict = Arc::new(
+        credentials_with_ttl(std::time::Duration::from_secs(30)).await.with_required_jti(true),
+    );
+    let error = strict.exchange_assertion(&without).await.expect_err("refused when required");
+    assert!(error.message().contains("jti"), "{}", error.message());
+}

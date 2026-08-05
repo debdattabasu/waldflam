@@ -244,6 +244,23 @@ one of three places, tried in that order:
    `/oauth2/v4/token`, and the assertion sent directly as the bearer.
    Assertions are capped at a one-hour lifetime, or a signed credential
    becomes a bearer secret with extra steps.
+
+   Assertions carrying a `jti` are **one-shot at the two exchange
+   endpoints** (`/oauth2/v4/token` and `signInWithCustomToken`), where an
+   assertion buys a new credential: the claim is spent into
+   `_used_assertions` — in MongoDB, since replay protection covering one
+   instance is no protection at all — keyed by hash of issuer + `jti`
+   (`jti` is unique per issuer, not globally) and expiring with the
+   assertion. The unique `_id` is what makes it safe under concurrency:
+   two instances racing the same replay both insert and exactly one wins.
+
+   It deliberately does **not** reach assertions used as bearer tokens.
+   That flow sends the same assertion on every request for its whole
+   lifetime, so spending it there would reject the legitimate client on its
+   second call. RFC 7523 leaves replay protection a MAY, which is also why
+   an assertion without a `jti` is allowed through unless
+   `WALDFLAM_AUTH_REQUIRE_JTI` is set — not every Google auth library sends
+   one.
 3. **A configured external issuer** (`WALDFLAM_AUTH_{ISSUER,AUDIENCE,JWKS_URL}`),
    for a deployment keeping Firebase Auth while it migrates. All three or
    none — a half-configured verifier rejects every token from an issuer the

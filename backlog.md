@@ -157,6 +157,11 @@ These are the ones to fix before calling waldflam production-ready.
   uid, a project and a timestamp — no device, IP, or user agent — so there's
   no "your active sessions" view, and revoking one session means already
   holding that token. Only "sign out everywhere" is reachable by uid.
+- **Replay protection can't cover bearer assertions.** A `jti` is spent at the
+  two exchange endpoints, but the self-signed-JWT flow reuses one assertion
+  for its whole lifetime, so a captured one stays usable there until it
+  expires. Bounded by the one-hour cap and by TLS, and unavoidable without
+  changing what that flow is; the mitigation is to prefer the token exchange.
 - **Service accounts are project-scoped but not permission-scoped.** A service
   account is admin of its project, full stop; there is no notion of a
   read-only or collection-scoped credential, and OAuth2 `scope` on the

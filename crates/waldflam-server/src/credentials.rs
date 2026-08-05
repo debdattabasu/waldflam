@@ -133,6 +133,7 @@ pub struct Credentials {
     identities: RwLock<HashMap<String, CachedValidAfter>>,
     account_cache_ttl: Duration,
     check_revoked: bool,
+    require_jti: bool,
 }
 
 struct CachedAccount {
@@ -181,7 +182,20 @@ impl Credentials {
             identities: RwLock::new(HashMap::new()),
             account_cache_ttl: ACCOUNT_CACHE_TTL,
             check_revoked: false,
+            require_jti: false,
         }
+    }
+
+    /// Refuses one-shot assertions that carry no `jti`, instead of letting
+    /// them through unprotected.
+    ///
+    /// Off by default because the Google auth libraries don't all set one and
+    /// requiring it would lock them out. Turn it on where the clients are
+    /// yours: without it, replay protection is only as good as what each
+    /// client happens to send.
+    pub fn with_required_jti(mut self, require: bool) -> Self {
+        self.require_jti = require;
+        self
     }
 
     /// Checks every ID token against its user's revocation state, instead of
@@ -626,6 +640,50 @@ impl Credentials {
         Ok(claims)
     }
 
+    /// Spends a one-shot assertion, so presenting it twice fails the second
+    /// time.
+    ///
+    /// **Only for assertions redeemed once.** The self-signed-JWT flow sends
+    /// the *same* assertion as a bearer token on every request for its whole
+    /// lifetime, by design; spending it there would reject the legitimate
+    /// client on its second call. So this guards the two exchange
+    /// endpoints — where an assertion buys a new credential — and nothing
+    /// else.
+    ///
+    /// An assertion without a `jti` cannot be tracked, because there is
+    /// nothing to track it by. RFC 7523 makes replay protection a MAY for
+    /// exactly this reason, and a client that sends a `jti` gets it while one
+    /// that doesn't, doesn't — unless the deployment requires it.
+    async fn spend_assertion(
+        &self,
+        claims: &serde_json::Map<String, serde_json::Value>,
+        issuer: &str,
+    ) -> Result<(), Status> {
+        let Some(jti) = claims.get("jti").and_then(|v| v.as_str()).filter(|jti| !jti.is_empty())
+        else {
+            if self.require_jti {
+                return Err(Status::invalid_argument(
+                    "assertion must carry a `jti` claim (WALDFLAM_AUTH_REQUIRE_JTI is set)",
+                ));
+            }
+            return Ok(());
+        };
+
+        // Namespaced by issuer: `jti` is only unique per issuer, so two
+        // service accounts could legitimately pick the same one.
+        let id = hash_token(&format!("{issuer}:{jti}"));
+        // Remember it exactly as long as the assertion could be replayed —
+        // past its own expiry the signature check refuses it anyway.
+        let expires_at = waldflam_engine::credentials::expiry_at(
+            claim_i64(claims, "exp").unwrap_or_else(|| now_seconds() + MAX_ASSERTION_LIFETIME),
+        );
+        let first_use = self.store.claim_assertion(&id, expires_at).await.map_err(engine_status)?;
+        if !first_use {
+            return Err(Status::unauthenticated("assertion has already been used"));
+        }
+        Ok(())
+    }
+
     // ---- minting ---------------------------------------------------------
 
     /// Exchanges a service-account assertion for an access token: the OAuth2
@@ -641,7 +699,10 @@ impl Credentials {
             Some(kid) => self.account(kid, false).await?,
             None => self.account(issuer, true).await?,
         };
-        self.verify_assertion(assertion, &account, None)?;
+        let claims = self.verify_assertion(assertion, &account, None)?;
+        // One-shot: this assertion is being traded for an access token, so a
+        // second attempt with the same one is a replay.
+        self.spend_assertion(&claims, &account.client_email).await?;
         self.mint_access_token(&account).await
     }
 
@@ -674,6 +735,9 @@ impl Credentials {
             None => self.account(issuer, true).await?,
         };
         let claims = self.verify_assertion(custom_token, &account, Some(CUSTOM_TOKEN_AUDIENCE))?;
+        // Also one-shot: a custom token buys an ID token and a session, so
+        // replaying one would mint a second session from a captured copy.
+        self.spend_assertion(&claims, &account.client_email).await?;
 
         let uid = claims
             .get("uid")

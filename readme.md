@@ -155,6 +155,12 @@ their hour unless you set `WALDFLAM_AUTH_CHECK_REVOKED=1`, which checks every
 one against its user's revocation state at the cost of a lookup per request —
 the same tradeoff Firebase makes with `verifyIdToken(token, checkRevoked)`.
 
+An assertion carrying a `jti` is one-shot where it's *exchanged* for another
+credential, so a captured one can't be spent twice. It stays reusable where
+it's sent as a bearer token, because that flow reuses a single assertion for
+its whole lifetime by design. Set `WALDFLAM_AUTH_REQUIRE_JTI=1` to refuse
+exchanges without one, if your clients all send them.
+
 The signing key rotates without an outage:
 
 ```sh
