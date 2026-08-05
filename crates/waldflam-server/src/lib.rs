@@ -5,6 +5,7 @@ pub mod listen;
 pub mod rest;
 pub mod rules;
 pub mod service;
+pub mod tls;
 pub mod webchannel;
 pub mod write_stream;
 
@@ -24,6 +25,7 @@ pub async fn serve(
     store: Store,
     auth: auth::AuthPolicy,
     credentials: Arc<credentials::Credentials>,
+    tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
     let svc = Arc::new(FirestoreService::with_auth(store.clone(), auth));
     let pool = rest::descriptor_pool();
@@ -60,8 +62,64 @@ pub async fn serve(
         .layer(axum::middleware::from_fn_with_state(rest_state, webchannel::intercept))
         .layer(axum::middleware::from_fn(rest::cors));
 
-    tracing::info!(%addr, "waldflam listening (gRPC h2c + REST v1)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    match tls {
+        None => {
+            tracing::info!(%addr, "waldflam listening (gRPC h2c + REST v1)");
+            axum::serve(listener, router).await?;
+        }
+        Some(config) => {
+            tracing::info!(%addr, "waldflam listening over TLS (gRPC h2 + REST v1)");
+            serve_tls(listener, router, config).await?;
+        }
+    }
     Ok(())
+}
+
+/// Serves the same router over TLS.
+///
+/// Hand-rolled rather than handed to `axum::serve` because the protocol has
+/// to be decided per connection: gRPC needs HTTP/2 and the browser surfaces
+/// need HTTP/1.1, and which one a client wants is known only after the ALPN
+/// handshake. `auto::Builder` reads the negotiated protocol and serves
+/// whichever was agreed.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    config: Arc<tokio_rustls::rustls::ServerConfig>,
+) -> anyhow::Result<()> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // One failed accept must not take the server down; the usual
+            // cause is transient (descriptor exhaustion, a client vanishing
+            // between SYN and accept).
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS: accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let service = hyper_util::service::TowerToHyperService::new(router.clone());
+        tokio::spawn(async move {
+            let stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                // Scanners, health checks and clients that don't trust our
+                // certificate all land here. Debug, not warn: it is normal
+                // background noise on a public address.
+                Err(e) => {
+                    tracing::debug!(%peer, error = %e, "TLS: handshake failed");
+                    return;
+                }
+            };
+            let served =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            if let Err(e) = served {
+                tracing::debug!(%peer, error = %e, "TLS: connection ended");
+            }
+        });
+    }
 }

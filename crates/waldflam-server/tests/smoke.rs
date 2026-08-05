@@ -23,6 +23,7 @@ async fn serves_firestore_service_over_h2c() {
             store,
             format!("http://{addr}"),
         )),
+        None,
     ));
 
     let mut client = loop {

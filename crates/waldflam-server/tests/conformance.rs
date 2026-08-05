@@ -54,6 +54,7 @@ async fn boot() -> (FirestoreClient<tonic::transport::Channel>, String) {
             store,
             format!("http://{addr}"),
         )),
+        None,
     ));
     let client = loop {
         match FirestoreClient::connect(format!("http://{addr}")).await {

@@ -49,6 +49,10 @@ Environment:
   WALDFLAM_AUTH_JWKS_URL
   WALDFLAM_ADMIN_TOKEN   shared secret granting admin (weaker than a service
                          account: names nobody, never expires)
+  WALDFLAM_TLS_CERT      PEM certificate chain; with WALDFLAM_TLS_KEY, waldflam
+  WALDFLAM_TLS_KEY       terminates TLS itself (ALPN h2 + http/1.1)
+  WALDFLAM_TLS           set to `terminated` to acknowledge that something in
+                         front already terminates TLS, silencing the warning
 ";
 
 async fn serve() -> anyhow::Result<()> {
@@ -64,7 +68,31 @@ async fn serve() -> anyhow::Result<()> {
         credentials.warm().await?;
         tracing::info!(issuer = credentials.issuer(), "auth: waldflam is issuing tokens");
     }
-    waldflam_server::serve(addr, store, auth, credentials).await
+    let tls = tls_config()?;
+    waldflam_server::tls::warn_if_unprotected(
+        auth.guards_admin_api(),
+        tls.is_some(),
+        std::env::var("WALDFLAM_TLS").is_ok_and(|mode| mode == "terminated"),
+    );
+    waldflam_server::serve(addr, store, auth, credentials, tls).await
+}
+
+/// Reads the TLS certificate and key, if this deployment terminates TLS.
+///
+/// Both or neither: one without the other is a deployment that meant to be
+/// encrypted and silently would not be.
+fn tls_config() -> anyhow::Result<Option<Arc<tokio_rustls::rustls::ServerConfig>>> {
+    let get = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    match (get("WALDFLAM_TLS_CERT"), get("WALDFLAM_TLS_KEY")) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            waldflam_server::tls::load(std::path::Path::new(&cert), std::path::Path::new(&key))
+                .map(Some)
+        }
+        _ => Err(anyhow::anyhow!(
+            "TLS needs WALDFLAM_TLS_CERT and WALDFLAM_TLS_KEY together — set both or neither"
+        )),
+    }
 }
 
 fn mongo_uri() -> String {
