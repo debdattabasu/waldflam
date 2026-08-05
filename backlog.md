@@ -166,10 +166,23 @@ These are the ones to fix before calling waldflam production-ready.
   account is admin of its project, full stop; there is no notion of a
   read-only or collection-scoped credential, and OAuth2 `scope` on the
   assertion is ignored.
-- **The private key lives in MongoDB.** waldflam must hold it to mint tokens,
-  so anyone who can read the database can mint any identity. That makes the
-  MongoDB deployment part of the trust boundary — fine when they're operated
-  together, worth an envelope-encryption story otherwise.
+- **The signing key is stored in the clear unless you say otherwise.** Sealing
+  (`WALDFLAM_KEK`) and remote signing (`WALDFLAM_SIGNER_URL`) are both opt-in,
+  so the default still puts the key in reach of anyone who can read the
+  database. Defaulting to sealed would mean generating and storing a KEK
+  somewhere, which is the operator's decision to make; but the default is the
+  weaker one and that is worth knowing. See the threat model in
+  architecture.md §3.
+- **No vendor signer clients.** `RemoteSigner` speaks a small HTTP contract
+  that a shim can put in front of Cloud KMS, Vault transit or PKCS#11, but
+  waldflam ships no client for any of them, so using one means running that
+  shim.
+- **A remote signer is on the hot path with no caching or retry.** Every token
+  minted is an outbound call; if the signer is slow, sign-in is slow, and a
+  blip becomes a failed request rather than a retried one.
+- **KEK rotation is unimplemented.** `seal-signing-key` adopts a KEK, but
+  there's no way to re-seal under a new one — that currently means rotating
+  the signing key instead, which is a different and larger operation.
 - **`WALDFLAM_PUBLIC_URL` is load-bearing and silent about it.** It becomes
   the `iss` of every minted token and is compared on the way back in, so
   changing it invalidates outstanding tokens, and getting it wrong emits key

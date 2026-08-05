@@ -136,6 +136,9 @@ pub struct Credentials {
     require_jti: bool,
     /// Seals the signing key at rest when set. See `sealing`.
     kek: Option<crate::sealing::Kek>,
+    /// When set, the private key lives elsewhere and waldflam never holds
+    /// it — nothing is generated or stored locally. See `signer`.
+    remote_signer: Option<std::sync::Arc<crate::signer::RemoteSigner>>,
 }
 
 struct CachedAccount {
@@ -155,8 +158,9 @@ struct CachedSigning {
 
 /// Loaded signing material for the deployment key.
 struct Signing {
-    key_id: String,
-    encoding: jsonwebtoken::EncodingKey,
+    /// Whatever holds the private half — in memory, or somewhere that never
+    /// hands it over. See `signer`.
+    signer: std::sync::Arc<dyn crate::signer::Signer>,
     /// Every key whose signatures are still accepted, by `kid` — retired keys
     /// included, so rotation doesn't invalidate tokens already in flight.
     verifying: HashMap<String, jsonwebtoken::DecodingKey>,
@@ -186,7 +190,21 @@ impl Credentials {
             check_revoked: false,
             require_jti: false,
             kek: None,
+            remote_signer: None,
         }
+    }
+
+    /// Signs through something that holds the key, instead of holding it.
+    ///
+    /// Mutually exclusive with a local key by construction: with this set,
+    /// waldflam neither generates nor stores signing material, so sealing has
+    /// nothing left to seal and key rotation belongs to the signer.
+    pub fn with_remote_signer(
+        mut self,
+        signer: Option<std::sync::Arc<crate::signer::RemoteSigner>>,
+    ) -> Self {
+        self.remote_signer = signer;
+        self
     }
 
     /// Encrypts the signing key at rest under this key-encryption key.
@@ -269,6 +287,15 @@ impl Credentials {
         self.reload_signing().await
     }
 
+    /// Where the signing material comes from: a key this process holds, or a
+    /// signer that holds it for us.
+    async fn load_signing(&self) -> Result<Signing, Status> {
+        match &self.remote_signer {
+            Some(remote) => Signing::remote(remote.clone()),
+            None => Signing::load(&self.store, self.kek.as_ref()).await,
+        }
+    }
+
     async fn reload_signing(&self) -> Result<std::sync::Arc<Signing>, Status> {
         let mut slot = self.signing.write().await;
         // Someone else may have reloaded while this task waited for the lock.
@@ -277,7 +304,7 @@ impl Credentials {
         {
             return Ok(cached.signing.clone());
         }
-        let signing = std::sync::Arc::new(Signing::load(&self.store, self.kek.as_ref()).await?);
+        let signing = std::sync::Arc::new(self.load_signing().await?);
         *slot = Some(CachedSigning { at: Instant::now(), signing: signing.clone() });
         Ok(signing)
     }
@@ -313,7 +340,7 @@ impl Credentials {
             }
             *last = Some(Instant::now());
         }
-        let reloaded = std::sync::Arc::new(Signing::load(&self.store, self.kek.as_ref()).await?);
+        let reloaded = std::sync::Arc::new(self.load_signing().await?);
         *slot = Some(CachedSigning { at: Instant::now(), signing: reloaded.clone() });
         Ok(reloaded)
     }
@@ -927,10 +954,7 @@ impl Credentials {
 
     async fn sign(&self, claims: serde_json::Value) -> Result<String, Status> {
         let signing = self.signing().await?;
-        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some(signing.key_id.clone());
-        jsonwebtoken::encode(&header, &claims, &signing.encoding)
-            .map_err(|e| Status::internal(format!("cannot sign token: {e}")))
+        crate::signer::sign_jwt(signing.signer.as_ref(), &claims).await
     }
 }
 
@@ -1050,13 +1074,35 @@ impl Signing {
         }
 
         let pem = private_key_of(&active, kek)?;
+        let signer = crate::signer::LocalSigner::from_pem(&active.key_id, &pem)?;
         Ok(Self {
-            key_id: active.key_id.clone(),
-            encoding: jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
-                .map_err(|e| Status::internal(format!("stored signing key unusable: {e}")))?,
+            signer: std::sync::Arc::new(signer),
             verifying,
             jwks: serde_json::json!({ "keys": jwks }),
         })
+    }
+
+    /// Builds signing material around a signer that holds the key elsewhere.
+    ///
+    /// Nothing is stored in `_signing_keys` in this arrangement: waldflam has
+    /// no private half to keep, and the public one comes from the signer. Key
+    /// rotation therefore belongs to whatever is behind it, and waldflam
+    /// follows whichever `kid` it reports.
+    fn remote(signer: std::sync::Arc<crate::signer::RemoteSigner>) -> Result<Self, Status> {
+        use crate::signer::Signer as _;
+        let (modulus, exponent) = signer.public_key();
+        let key_id = signer.key_id().to_owned();
+        let verifying = HashMap::from([(
+            key_id.clone(),
+            jsonwebtoken::DecodingKey::from_rsa_components(modulus, exponent).map_err(|e| {
+                Status::internal(format!("the signer's public key is unusable: {e}"))
+            })?,
+        )]);
+        let jwks = serde_json::json!({ "keys": [{
+            "kty": "RSA", "alg": "RS256", "use": "sig",
+            "kid": key_id, "n": modulus, "e": exponent,
+        }]});
+        Ok(Self { signer, verifying, jwks })
     }
 }
 

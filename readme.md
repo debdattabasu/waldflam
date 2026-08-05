@@ -189,6 +189,28 @@ waldflam refuses to start if the stored key is sealed and no key-encryption
 key is configured, and says so distinctly if the configured one is the wrong
 one rather than reporting an indistinguishable decryption failure.
 
+Or don't hold the key at all — point waldflam at something that does:
+
+```sh
+WALDFLAM_SIGNER_URL=https://signer.internal/waldflam
+WALDFLAM_SIGNER_TOKEN=<credential for it>   # optional
+```
+
+Then waldflam stores no signing key, and rotation belongs to the signer.
+The contract is two calls, so a shim in front of Cloud KMS, Vault's transit
+engine or a PKCS#11 device is a short script:
+
+```
+GET  <url>  → {"kid": "...", "n": "<base64url>", "e": "<base64url>"}
+POST <url>  ← {"message": "<base64url>"}  → {"signature": "<base64url>"}
+```
+
+This *also* doesn't stop an attacker on the host — they can call the signer
+with the same credentials. What it changes is the shape of the loss: a stolen
+key is transferable, silent and good forever, while a stolen ability to call
+a signer works only from where those credentials work, is logged by the
+signer, and stops when that binding is revoked.
+
 The signing key rotates without an outage:
 
 ```sh

@@ -311,6 +311,41 @@ becomes anonymous rather than an error, so rules decide and deny by default.
 Without this, one tenant's identity would authenticate against another's data
 in a multi-project deployment.
 
+**Threat model for the signing key.** Worth stating plainly, because the
+usual claim for this class of design is wrong.
+
+waldflam must be able to sign, so *something* it can reach must hold the key.
+Three arrangements, in ascending order of what they cost and buy:
+
+| | Reachable by a database reader | Reachable by an attacker on the host |
+|---|---|---|
+| Plaintext in MongoDB (default) | yes — the key itself | yes |
+| Sealed under a KEK (`sealing`) | no | yes — the KEK is on the host |
+| Remote signer (`signer`) | nothing to read | yes — but only to *use*, not to take |
+
+The column that moves is the first one, and it is the one that matters,
+because *"can read the database" is a much larger set than "has root on the
+host"*: backups (dumps by definition, retained for years, restored into
+staging, copied to laptops), volume snapshots, a managed provider's
+operators, a leaked connection string in CI or a Kubernetes Secret, an
+exposed port. Rotation being manual makes it worse — an old backup holds a
+key that is probably still active.
+
+No arrangement here defends against an attacker on the waldflam host. They
+hold the KEK, or they can call the signer with the same credentials waldflam
+uses; they can also read tokens in flight and request bodies. That is not the
+design target and cannot be.
+
+What the remote signer changes is not confidentiality but the *shape of the
+loss*: a stolen key is transferable, silent, and good forever, while a stolen
+ability to call a signer works only from where those credentials work, is
+logged by the signer, and ends when the binding is revoked.
+
+The practical reading: sealing is worth most where the database is further
+away than the host (managed MongoDB, cloud backups, a provider you don't
+operate) and least on one machine you own outright, where those are the same
+people.
+
 **User identities** come from the Firebase flow: a service account mints a
 custom token for a `uid` (`aud` = the identitytoolkit audience), the client
 trades it at `/v1/accounts:signInWithCustomToken`, and waldflam signs the ID
@@ -504,6 +539,8 @@ Where the design lives in the code:
 | Trigger registry + dispatcher | `waldflam-server/src/functions.rs` |
 | Auth: emulator semantics + verified mode | `waldflam-server/src/auth.rs` |
 | Service accounts, token minting, JWKS, rotation | `waldflam-server/src/credentials.rs` |
+| Signing seam: in-process or remote (KMS/HSM) | `waldflam-server/src/signer.rs` |
+| Encrypting the signing key at rest | `waldflam-server/src/sealing.rs` |
 | Credential records (accounts, keys, sessions) | `waldflam-engine/src/credentials.rs` |
 | TLS termination (ALPN h2 + http/1.1) | `waldflam-server/src/tls.rs` |
 

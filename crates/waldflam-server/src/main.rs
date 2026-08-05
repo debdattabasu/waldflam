@@ -71,6 +71,9 @@ Environment:
   WALDFLAM_KEK_FILE      rest, so a database dump (or a backup, or a snapshot)
                          yields nothing usable. The file form keeps it out of
                          the process environment. Set one, not both
+  WALDFLAM_SIGNER_URL    sign through something that holds the key (KMS, Vault,
+  WALDFLAM_SIGNER_TOKEN  an HSM) instead of holding it. waldflam then stores no
+                         signing key at all, and rotation belongs to the signer
   WALDFLAM_TLS_CERT      PEM certificate chain; with WALDFLAM_TLS_KEY, waldflam
   WALDFLAM_TLS_KEY       terminates TLS itself (ALPN h2 + http/1.1)
   WALDFLAM_TLS           set to `terminated` to acknowledge that something in
@@ -85,7 +88,10 @@ async fn serve() -> anyhow::Result<()> {
         Credentials::new(store.clone(), public_url())
             .with_revocation_checks(enabled("WALDFLAM_AUTH_CHECK_REVOKED"))
             .with_required_jti(enabled("WALDFLAM_AUTH_REQUIRE_JTI"))
-            .with_kek(waldflam_server::sealing::from_env()?),
+            .with_kek(waldflam_server::sealing::from_env()?)
+            .with_remote_signer(
+                waldflam_server::signer::from_env().await?.map(std::sync::Arc::new),
+            ),
     );
     let auth = auth_policy(credentials.clone())?;
     if auth.guards_admin_api() {

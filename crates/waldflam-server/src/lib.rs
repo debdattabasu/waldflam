@@ -6,6 +6,7 @@ pub mod rest;
 pub mod rules;
 pub mod sealing;
 pub mod service;
+pub mod signer;
 pub mod tls;
 pub mod webchannel;
 pub mod write_stream;
