@@ -27,6 +27,38 @@ const SIGNING_KEYS: &str = "_signing_keys";
 /// `_id` of the key currently used to sign.
 pub const ACTIVE_SIGNING_KEY: &str = "active";
 
+/// Collection every instance tails to learn that a credential stopped being
+/// valid. See [`CredentialEvent`].
+const CREDENTIAL_EVENTS: &str = "_credential_events";
+
+/// How long an invalidation notice lives before MongoDB reaps it. It only has
+/// to outlast the moment live instances read it — an instance that was down
+/// re-reads the underlying record on its next cache miss regardless.
+const CREDENTIAL_EVENT_TTL_SECONDS: u64 = 3600;
+
+/// A credential stopped being valid somewhere in the cluster.
+///
+/// Instances cache credential lookups, so without this the only thing ending
+/// a revoked credential's life elsewhere is that cache expiring — a window of
+/// tens of seconds. Broadcasting makes the common case immediate and leaves
+/// the cache lifetime as the backstop for an instance whose change stream has
+/// broken.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialEvent {
+    /// Who published it, so an instance can skip its own notice.
+    pub instance: String,
+    /// What `selectors` name — see [`KIND_SERVICE_ACCOUNT`].
+    pub kind: String,
+    /// Cache keys to drop. A service account is reachable by key id *and* by
+    /// email, so revoking one names both.
+    pub selectors: Vec<String>,
+    /// TTL anchor; MongoDB reaps the notice once this passes.
+    pub expires_at: mongodb::bson::DateTime,
+}
+
+/// A service account was revoked.
+pub const KIND_SERVICE_ACCOUNT: &str = "service_account";
+
 /// A registered service account.
 ///
 /// waldflam keeps only the *public* half. The private key is handed to the
@@ -131,16 +163,80 @@ impl Store {
 
     /// Revokes by key id or by email, whichever the operator had to hand.
     /// Returns the account as it now stands, or `None` if nothing matched.
+    ///
+    /// Publishes an invalidation notice so the other instances stop honouring
+    /// it now rather than whenever their caches happen to turn over.
     pub async fn revoke_service_account(
         &self,
         selector: &str,
     ) -> Result<Option<ServiceAccount>, EngineError> {
         let filter = doc! { "$or": [{ "_id": selector }, { "client_email": selector }] };
-        Ok(self
+        let revoked = self
             .service_accounts()
             .find_one_and_update(filter, doc! { "$set": { "revoked": true } })
             .return_document(mongodb::options::ReturnDocument::After)
-            .await?)
+            .await?;
+        if let Some(account) = &revoked {
+            self.publish_credential_event(
+                KIND_SERVICE_ACCOUNT,
+                vec![account.key_id.clone(), account.client_email.clone()],
+            )
+            .await?;
+        }
+        Ok(revoked)
+    }
+
+    fn credential_events(&self) -> Collection<CredentialEvent> {
+        self.db().collection(CREDENTIAL_EVENTS)
+    }
+
+    /// Tells every instance to forget what it cached about these selectors.
+    pub async fn publish_credential_event(
+        &self,
+        kind: &str,
+        selectors: Vec<String>,
+    ) -> Result<(), EngineError> {
+        let index = mongodb::IndexModel::builder()
+            .keys(doc! { "expires_at": 1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(std::time::Duration::from_secs(0))
+                    .build(),
+            )
+            .build();
+        self.credential_events().create_index(index).await?;
+        let event = CredentialEvent {
+            instance: self.instance_id().to_string(),
+            kind: kind.to_owned(),
+            selectors,
+            expires_at: mongodb::bson::DateTime::from_system_time(
+                std::time::SystemTime::now()
+                    + std::time::Duration::from_secs(CREDENTIAL_EVENT_TTL_SECONDS),
+            ),
+        };
+        self.credential_events().insert_one(event).await?;
+        Ok(())
+    }
+
+    /// Tails credential invalidations from every instance.
+    pub async fn watch_credential_events(
+        &self,
+        resume_after: Option<mongodb::change_stream::event::ResumeToken>,
+    ) -> Result<
+        mongodb::change_stream::ChangeStream<
+            mongodb::change_stream::event::ChangeStreamEvent<CredentialEvent>,
+        >,
+        EngineError,
+    > {
+        // A change stream on a collection that has never been written to is
+        // fine in MongoDB, so there is nothing to create up front.
+        let events = self.credential_events();
+        let watch = events.watch();
+        let watch = match resume_after {
+            Some(token) => watch.resume_after(token),
+            None => watch,
+        };
+        Ok(watch.await?)
     }
 
     /// Returns the active signing key, inserting `candidate` if there isn't

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::StreamExt as _;
 use rsa::traits::PublicKeyParts as _;
 use tonic::Status;
 use waldflam_engine::credentials::{ACTIVE_SIGNING_KEY, ServiceAccount, SigningKey};
@@ -136,13 +137,24 @@ impl Credentials {
         }
     }
 
-    /// Overrides how long service-account lookups are cached — which is the
-    /// same thing as how long a credential revoked on *another* instance
-    /// keeps working here. Lower it if immediate revocation matters more than
-    /// the extra reads.
+    /// Overrides how long credential lookups are cached.
+    ///
+    /// With the invalidation broadcast running this is only the backstop —
+    /// how long a revocation could go unnoticed by an instance whose change
+    /// stream is broken. Lower it if that worst case matters more than the
+    /// extra reads.
     pub fn with_account_cache_ttl(mut self, ttl: Duration) -> Self {
         self.account_cache_ttl = ttl;
         self
+    }
+
+    /// Drops whatever is cached for these selectors, so the next request
+    /// re-reads them.
+    fn forget(&self, selectors: &[String]) {
+        let mut cache = self.accounts.write().expect("account cache");
+        for selector in selectors {
+            cache.remove(selector);
+        }
     }
 
     pub fn issuer(&self) -> &str {
@@ -242,9 +254,9 @@ impl Credentials {
     ) -> Result<Option<ServiceAccount>, Status> {
         let revoked = self.store.revoke_service_account(selector).await.map_err(engine_status)?;
         if let Some(account) = &revoked {
-            let mut cache = self.accounts.write().expect("account cache");
-            cache.remove(&account.key_id);
-            cache.remove(&account.client_email);
+            // Locally now; the other instances learn from the notice the
+            // store just published.
+            self.forget(&[account.key_id.clone(), account.client_email.clone()]);
         }
         Ok(revoked)
     }
@@ -600,6 +612,59 @@ impl Credentials {
         jsonwebtoken::encode(&header, &claims, &signing.encoding)
             .map_err(|e| Status::internal(format!("cannot sign token: {e}")))
     }
+}
+
+/// How long to wait before rebuilding a change stream that errored, so a
+/// MongoDB outage doesn't become a reconnect storm.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Starts applying other instances' credential invalidations to this one's
+/// caches.
+///
+/// Runs until the process exits, resuming its change stream where it left
+/// off. If it can't — MongoDB down, stream broken — nothing is unsafe; the
+/// cache lifetime takes over as the slower path it always was.
+pub fn spawn_invalidation_watcher(credentials: std::sync::Arc<Credentials>) {
+    tokio::spawn(async move {
+        let mut resume_token = None;
+        loop {
+            let mut stream =
+                match credentials.store.watch_credential_events(resume_token.clone()).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!(%error, "credentials: cannot open invalidation stream");
+                        tokio::time::sleep(RECONNECT_DELAY).await;
+                        continue;
+                    }
+                };
+            tracing::debug!("credentials: tailing invalidations");
+            while let Some(next) = stream.next().await {
+                match next {
+                    Ok(event) => {
+                        resume_token = stream.resume_token();
+                        let Some(notice) = event.full_document else {
+                            continue;
+                        };
+                        // Ours was applied before it was published.
+                        if notice.instance == credentials.store.instance_id() {
+                            continue;
+                        }
+                        tracing::info!(
+                            kind = %notice.kind,
+                            count = notice.selectors.len(),
+                            "credentials: applying a revocation from another instance"
+                        );
+                        credentials.forget(&notice.selectors);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "credentials: invalidation stream failed, resuming");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    });
 }
 
 /// The result of signing in: what the identitytoolkit response carries.

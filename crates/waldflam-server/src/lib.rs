@@ -34,6 +34,10 @@ pub async fn serve(
     // Republishes other instances' commits onto this instance's hub, so
     // Listen streams here see writes applied anywhere in the cluster.
     waldflam_engine::fanout::spawn(store, svc.hub_handle());
+    // Applies revocations published by other instances, so a credential
+    // revoked anywhere stops working here immediately rather than whenever
+    // this instance's cache next turns over.
+    credentials::spawn_invalidation_watcher(credentials.clone());
     let rest_state = rest::RestState {
         svc: svc.clone(),
         pool,

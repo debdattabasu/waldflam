@@ -340,3 +340,35 @@ async fn revocation_reaches_other_instances_and_stays_that_way() {
         );
     }
 }
+
+/// Revoking on one instance must reach the others *now*, not when their
+/// caches happen to turn over.
+///
+/// The cache lifetime here is five minutes, so a pass cannot come from
+/// expiry — only from the invalidation broadcast.
+#[tokio::test]
+async fn a_revocation_reaches_another_instance_immediately() {
+    let ttl = std::time::Duration::from_secs(300);
+    let one = Arc::new(credentials_with_ttl(ttl).await);
+    let two = Arc::new(credentials_with_ttl(ttl).await);
+    waldflam_server::credentials::spawn_invalidation_watcher(two.clone());
+    // A change stream opened without a resume token only sees what happens
+    // after it opens, so let the watcher get established before publishing.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let (account, key_file) =
+        one.create_service_account(&unique("broadcast"), "demo").await.expect("create");
+    let signed = assertion(&key_file, ISSUER);
+    let policy = policy(two.clone());
+    assert!(judge(&policy, &signed).await.is_ok(), "valid before revocation, and now cached");
+
+    one.revoke_service_account(&account.client_email).await.expect("revoke");
+
+    for _ in 0..100 {
+        if judge(&policy, &signed).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("revocation did not reach the other instance within 5s, and its cache lasts 300s");
+}
