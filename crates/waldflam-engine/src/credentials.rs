@@ -153,7 +153,9 @@ pub struct ServiceAccount {
 /// identity, which makes the MongoDB deployment part of the trust boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningKey {
-    /// Role, not identity — see [`ACTIVE_SIGNING_KEY`].
+    /// [`ACTIVE_SIGNING_KEY`] for the key currently signing, and the key id
+    /// for retired ones. A fixed `_id` for the active key is what makes
+    /// "create one if none exists" and "swap it" single atomic operations.
     #[serde(rename = "_id")]
     pub role: String,
     /// Published as the JWK `kid`, and set on the header of tokens we sign.
@@ -163,6 +165,11 @@ pub struct SigningKey {
     pub modulus: String,
     pub exponent: String,
     pub created_us: i64,
+    /// When a retired key stops verifying and may be deleted; `0` on the
+    /// active key. Retired keys keep verifying until every token they signed
+    /// has expired, or rotating would invalidate tokens already in flight.
+    #[serde(default)]
+    pub retire_after_us: i64,
 }
 
 impl Store {
@@ -420,6 +427,49 @@ impl Store {
         use futures::TryStreamExt as _;
         let cursor = self.signing_keys().find(doc! {}).await?;
         Ok(cursor.try_collect().await?)
+    }
+
+    /// Promotes `candidate` to the signing key and retires the current one.
+    ///
+    /// Retiring rather than deleting is the point: tokens signed by the old
+    /// key are still in circulation, and a rotation that invalidated them
+    /// would be an outage. It keeps verifying until `retire_after_us`, which
+    /// the caller sets past the longest-lived token it could have signed.
+    ///
+    /// One transaction, so no window exists in which the deployment has two
+    /// active keys or none.
+    pub async fn rotate_signing_key(
+        &self,
+        candidate: &SigningKey,
+        retire_after_us: i64,
+    ) -> Result<SigningKey, EngineError> {
+        let mut session = self.start_session().await?;
+        session.start_transaction().await?;
+        let keys = self.signing_keys();
+
+        if let Some(current) =
+            keys.find_one(doc! { "_id": ACTIVE_SIGNING_KEY }).session(&mut session).await?
+        {
+            let retired = SigningKey { role: current.key_id.clone(), retire_after_us, ..current };
+            // `_id` is immutable, so retiring is an insert plus a delete
+            // rather than an update.
+            keys.insert_one(&retired).session(&mut session).await?;
+            keys.delete_one(doc! { "_id": ACTIVE_SIGNING_KEY }).session(&mut session).await?;
+        }
+        keys.insert_one(candidate).session(&mut session).await?;
+        session.commit_transaction().await?;
+        Ok(candidate.clone())
+    }
+
+    /// Deletes retired keys whose tokens have all expired. Nothing verifies
+    /// against them any more, so keeping them only widens what a database
+    /// dump is worth.
+    pub async fn purge_retired_signing_keys(&self, now_us: i64) -> Result<u64, EngineError> {
+        let deleted = self
+            .signing_keys()
+            .delete_many(doc! { "retire_after_us": { "$gt": 0, "$lt": now_us } })
+            .await?;
+        Ok(deleted.deleted_count)
     }
 }
 

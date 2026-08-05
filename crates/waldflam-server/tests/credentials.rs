@@ -465,3 +465,58 @@ async fn id_tokens_survive_revocation_unless_checks_are_on() {
         "with revocation checks on, a signed-out user's ID token must be refused"
     );
 }
+
+/// Rotation must not be an outage: tokens signed by the old key have to keep
+/// verifying until they expire, and the new key has to take over for signing.
+#[tokio::test]
+async fn rotating_the_signing_key_keeps_old_tokens_working() {
+    let credentials = credentials().await;
+    let before = sign_in(&credentials, "rotate", "erin").await;
+    let policy = policy(credentials.clone());
+    assert!(judge(&policy, &before.id_token).await.is_ok(), "valid before rotation");
+
+    let old_kid = jsonwebtoken::decode_header(&before.id_token).expect("header").kid.expect("kid");
+    let new_kid = credentials.rotate_signing_key().await.expect("rotate");
+    assert_ne!(new_kid, old_kid, "rotation must produce a different key");
+
+    // The whole point: a token already in circulation still verifies.
+    assert!(
+        judge(&policy, &before.id_token).await.is_ok(),
+        "a token signed by the retired key must keep working until it expires"
+    );
+
+    // And new tokens carry the new key.
+    let after = sign_in(&credentials, "rotate2", "erin").await;
+    let signed_with =
+        jsonwebtoken::decode_header(&after.id_token).expect("header").kid.expect("kid");
+    assert_eq!(signed_with, new_kid, "new tokens must be signed by the new key");
+    assert!(judge(&policy, &after.id_token).await.is_ok());
+
+    // Both keys are published, or verifiers could not check both.
+    let jwks = credentials.jwks().await.expect("jwks");
+    let published: Vec<&str> =
+        jwks["keys"].as_array().expect("keys").iter().filter_map(|k| k["kid"].as_str()).collect();
+    assert!(published.contains(&old_kid.as_str()), "the retired key must still be published");
+    assert!(published.contains(&new_kid.as_str()), "the new key must be published");
+}
+
+/// A key rotated in on one instance has to be picked up by another without
+/// waiting out its refresh interval, or every token minted after a rotation
+/// would be rejected there for a minute.
+#[tokio::test]
+async fn another_instance_picks_up_a_rotated_key() {
+    let one = credentials().await;
+    let two = credentials().await;
+
+    // Give `two` a loaded key set that predates the rotation.
+    let before = sign_in(&one, "pickup", "frank").await;
+    assert!(judge(&policy(two.clone()), &before.id_token).await.is_ok());
+
+    one.rotate_signing_key().await.expect("rotate");
+    let after = sign_in(&one, "pickup2", "frank").await;
+
+    assert!(
+        judge(&policy(two.clone()), &after.id_token).await.is_ok(),
+        "a token naming an unfamiliar key must trigger a re-read, not a rejection"
+    );
+}

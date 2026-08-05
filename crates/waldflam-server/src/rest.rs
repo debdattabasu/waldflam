@@ -257,7 +257,20 @@ pub async fn oauth_token(State(state): State<RestState>, body: Bytes) -> Respons
 /// so its own verifier and anything else that speaks OIDC can check them.
 pub async fn jwks(State(state): State<RestState>) -> Response {
     match state.credentials.jwks().await {
-        Ok(keys) => json_ok(keys),
+        Ok(keys) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                // Verifiers cache key sets by this header — Google's do, and
+                // so does anything following OIDC. It has to stay well under
+                // how long a retired key keeps verifying, or a client could
+                // still be holding the old set when tokens signed by the new
+                // key start arriving.
+                (header::CACHE_CONTROL, "public, max-age=300"),
+            ],
+            keys.to_string(),
+        )
+            .into_response(),
         Err(status) => status_response(&status),
     }
 }

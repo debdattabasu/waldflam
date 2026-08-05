@@ -65,6 +65,26 @@ const ACCOUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Size of generated RSA keys.
 const KEY_BITS: usize = 2048;
 
+/// How long this instance reuses its copy of the signing keys before
+/// re-reading them. Bounds how long a rotation elsewhere goes unnoticed;
+/// a token naming an unknown key forces a reload anyway, so this only
+/// governs when we stop *signing* with a key that has been retired.
+const SIGNING_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Shortest gap between key re-reads prompted by a token naming a key we
+/// don't know. Without it, junk tokens would be a way to make this server
+/// hammer MongoDB.
+const SIGNING_RELOAD_THROTTLE: Duration = Duration::from_secs(5);
+
+/// How long a retired key keeps verifying. Every token it could have signed
+/// is an access or ID token, both of which live an hour; the extra covers
+/// clock skew and instances that hadn't noticed the rotation yet.
+///
+/// Refresh tokens are deliberately *not* in this calculation — they are
+/// opaque and stored, not signed, so a thirty-day session no longer forces a
+/// thirty-day key retention.
+const RETIRED_KEY_GRACE: i64 = ACCESS_TOKEN_TTL + SIGNING_REFRESH_INTERVAL.as_secs() as i64 + 300;
+
 /// The `aud` the Firebase Admin SDKs put on a custom token.
 const CUSTOM_TOKEN_AUDIENCE: &str =
     "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit";
@@ -102,7 +122,12 @@ pub struct Credentials {
     /// key file points back at. Externally reachable, or the credentials it
     /// emits will point clients somewhere they cannot go.
     issuer: String,
-    signing: tokio::sync::OnceCell<Signing>,
+    /// Reloadable, not load-once: a key rotated on another instance has to
+    /// be picked up here, both to verify its tokens and to stop signing with
+    /// the retired one.
+    signing: tokio::sync::RwLock<Option<CachedSigning>>,
+    /// When a token naming an unknown key last prompted a re-read.
+    last_key_miss: std::sync::Mutex<Option<Instant>>,
     accounts: RwLock<HashMap<String, CachedAccount>>,
     /// `{project}:{uid}` → when that user's tokens stopped counting.
     identities: RwLock<HashMap<String, CachedValidAfter>>,
@@ -118,6 +143,11 @@ struct CachedAccount {
 struct CachedValidAfter {
     at: Instant,
     valid_after_us: i64,
+}
+
+struct CachedSigning {
+    at: Instant,
+    signing: std::sync::Arc<Signing>,
 }
 
 /// Loaded signing material for the deployment key.
@@ -145,7 +175,8 @@ impl Credentials {
         Self {
             store,
             issuer: issuer.trim_end_matches('/').to_owned(),
-            signing: tokio::sync::OnceCell::new(),
+            signing: tokio::sync::RwLock::new(None),
+            last_key_miss: std::sync::Mutex::new(None),
             accounts: RwLock::new(HashMap::new()),
             identities: RwLock::new(HashMap::new()),
             account_cache_ttl: ACCOUNT_CACHE_TTL,
@@ -201,8 +232,95 @@ impl Credentials {
         self.signing().await.map(|_| ())
     }
 
-    async fn signing(&self) -> Result<&Signing, Status> {
-        self.signing.get_or_try_init(|| Signing::load(&self.store)).await
+    /// The current signing material, reloading when the copy in hand is old
+    /// enough that a rotation elsewhere could have happened.
+    async fn signing(&self) -> Result<std::sync::Arc<Signing>, Status> {
+        if let Some(cached) = self.signing.read().await.as_ref()
+            && cached.at.elapsed() < SIGNING_REFRESH_INTERVAL
+        {
+            return Ok(cached.signing.clone());
+        }
+        self.reload_signing().await
+    }
+
+    async fn reload_signing(&self) -> Result<std::sync::Arc<Signing>, Status> {
+        let mut slot = self.signing.write().await;
+        // Someone else may have reloaded while this task waited for the lock.
+        if let Some(cached) = slot.as_ref()
+            && cached.at.elapsed() < SIGNING_REFRESH_INTERVAL
+        {
+            return Ok(cached.signing.clone());
+        }
+        let signing = std::sync::Arc::new(Signing::load(&self.store).await?);
+        *slot = Some(CachedSigning { at: Instant::now(), signing: signing.clone() });
+        Ok(signing)
+    }
+
+    /// Signing material that can verify `kid`, re-reading if this instance
+    /// has not yet seen the key a token names — which is exactly what a
+    /// rotation on another instance looks like from here.
+    ///
+    /// Throttled, because an unknown `kid` is also what a stream of junk
+    /// tokens looks like, and that must not become a stream of database
+    /// reads.
+    async fn signing_for(&self, kid: &str) -> Result<std::sync::Arc<Signing>, Status> {
+        let signing = self.signing().await?;
+        if signing.verifying.contains_key(kid) {
+            return Ok(signing);
+        }
+        let mut slot = self.signing.write().await;
+        if let Some(cached) = slot.as_ref()
+            && cached.signing.verifying.contains_key(kid)
+        {
+            // Another task reloaded while this one waited for the lock.
+            return Ok(cached.signing.clone());
+        }
+        // Throttle on when a *miss* last made us re-read, not on when the
+        // keys were loaded: the first unknown key after a rotation has to get
+        // through, and it is the repeats that need damping.
+        {
+            let mut last = self.last_key_miss.lock().expect("key miss clock");
+            if last.is_some_and(|at| at.elapsed() < SIGNING_RELOAD_THROTTLE)
+                && let Some(cached) = slot.as_ref()
+            {
+                return Ok(cached.signing.clone());
+            }
+            *last = Some(Instant::now());
+        }
+        let reloaded = std::sync::Arc::new(Signing::load(&self.store).await?);
+        *slot = Some(CachedSigning { at: Instant::now(), signing: reloaded.clone() });
+        Ok(reloaded)
+    }
+
+    /// Retires the current signing key and starts signing with a new one.
+    ///
+    /// The old key keeps verifying until every token it could have signed has
+    /// expired; anything shorter would invalidate tokens already in
+    /// circulation, which is an outage rather than a rotation.
+    pub async fn rotate_signing_key(&self) -> Result<String, Status> {
+        let generated = generate_key()?;
+        let now = now_seconds();
+        let candidate = SigningKey {
+            role: ACTIVE_SIGNING_KEY.into(),
+            key_id: random_id(),
+            private_key_pem: generated.private_key_pem,
+            modulus: generated.modulus,
+            exponent: generated.exponent,
+            created_us: now * 1_000_000,
+            retire_after_us: 0,
+        };
+        let retire_after_us = (now + RETIRED_KEY_GRACE) * 1_000_000;
+        let rotated = self
+            .store
+            .rotate_signing_key(&candidate, retire_after_us)
+            .await
+            .map_err(engine_status)?;
+        // Old enough keys are worth nothing but risk.
+        self.store.purge_retired_signing_keys(now * 1_000_000).await.map_err(engine_status)?;
+        // Drop this instance's copy so the next request picks the new key up
+        // rather than waiting out the refresh interval.
+        *self.signing.write().await = None;
+        Ok(rotated.key_id)
     }
 
     /// The public keys verifying waldflam-issued tokens, in JWK Set form.
@@ -363,11 +481,14 @@ impl Credentials {
             return Ok(None);
         };
 
-        // Ours to verify?
-        if let Some(kid) = header.kid.as_deref()
-            && self.signing().await?.verifying.contains_key(kid)
-        {
-            return self.resolve_issued(token, kid).await.map(Some);
+        // Ours to verify? `signing_for` re-reads when the key is unfamiliar,
+        // so a token signed by a key rotated in on another instance verifies
+        // here immediately instead of after this instance's next refresh.
+        if let Some(kid) = header.kid.as_deref() {
+            let signing = self.signing_for(kid).await?;
+            if signing.verifying.contains_key(kid) {
+                return self.resolve_issued(token, &signing, kid).await.map(Some);
+            }
         }
 
         // A service account's own assertion. Route by `kid` when present
@@ -392,8 +513,12 @@ impl Credentials {
     }
 
     /// Verifies a token waldflam signed, and says what it grants.
-    async fn resolve_issued(&self, token: &str, kid: &str) -> Result<Resolved, Status> {
-        let signing = self.signing().await?;
+    async fn resolve_issued(
+        &self,
+        token: &str,
+        signing: &Signing,
+        kid: &str,
+    ) -> Result<Resolved, Status> {
         let key = signing.verifying.get(kid).expect("checked by caller");
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
@@ -811,6 +936,7 @@ impl Signing {
                     modulus: generated.modulus,
                     exponent: generated.exponent,
                     created_us: now_seconds() * 1_000_000,
+                    retire_after_us: 0,
                 };
                 store.signing_key_or_insert(&candidate).await.map_err(engine_status)?
             }

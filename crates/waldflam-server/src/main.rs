@@ -33,6 +33,9 @@ waldflam — a Firebase-compatible backend
   waldflam credentials revoke <who>     revoke by key id or email
   waldflam credentials revoke-user <uid>
                                         end every session a user has
+  waldflam credentials rotate-signing-key
+                                        sign with a new key; the old one keeps
+                                        verifying until its tokens expire
 
 Options for `credentials create`:
   --project <id>   project the credential is admin of (default: WALDFLAM_PROJECT
@@ -235,6 +238,17 @@ async fn credentials_cli(args: &[String]) -> anyhow::Result<()> {
                     if account.revoked { "\tREVOKED" } else { "" }
                 );
             }
+        }
+        Some("rotate-signing-key") => {
+            let key_id = credentials
+                .rotate_signing_key()
+                .await
+                .map_err(|status| anyhow::anyhow!("{}", status.message()))?;
+            eprintln!(
+                "now signing with {key_id}\n\
+                 The previous key keeps verifying until the tokens it signed expire, \
+                 so nothing in flight breaks."
+            );
         }
         Some("revoke-user") => {
             let uid = args.get(1).ok_or_else(|| {
