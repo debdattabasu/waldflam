@@ -66,9 +66,14 @@ const discovery = await (await fetch(`${base}/.well-known/openid-configuration`)
 assert(discovery.issuer === base, `issuer ${discovery.issuer} should be ${base}`);
 assert(discovery.token_endpoint === keyFile.token_uri, 'discovery must match the key file');
 
-const jwks = await (await fetch(`${base}/.well-known/jwks.json`)).json();
+const jwksRes = await fetch(`${base}/.well-known/jwks.json`);
+const jwks = await jwksRes.json();
 assert(jwks.keys?.length >= 1 && jwks.keys[0].kty === 'RSA', 'JWKS must publish an RSA key');
 assert(jwks.keys.every((k) => k.kid && k.n && k.e && !k.d), 'JWKS must never carry a private key');
+// Verifiers cache key sets by this header; without it they would refetch on
+// every token, or worse, cache forever and miss a rotation.
+assert(/max-age=\d+/.test(jwksRes.headers.get('cache-control') || ''),
+  `JWKS must say how long it may be cached, got ${jwksRes.headers.get('cache-control')}`);
 console.log('CRED DISCOVERY ok:', discovery.issuer, `${jwks.keys.length} key(s)`);
 
 // ---- the emulator's backdoors must not exist here ------------------------
@@ -203,7 +208,28 @@ assert((await write('users/alice', { n: { integerValue: '2' } }, refreshed.id_to
 // The refresh token itself is not a credential.
 assert((await read('users/alice', signIn.refreshToken)).status === 401,
   'a refresh token must not authenticate requests');
+// Opaque, not a JWT: it is a database key, and nothing about the session
+// should be readable from the token itself.
+assert(!signIn.refreshToken.includes('.'), 'a refresh token must be opaque');
 console.log('CRED REFRESH ok: refreshed identity works, refresh token alone does not');
+
+// ---- ending a session ----------------------------------------------------
+
+const revokeUser = (token) => fetch(
+  `${base}/emulator/v1/projects/${project}/accounts/alice:revokeRefreshTokens`,
+  { method: 'POST', headers: token ? { authorization: `Bearer ${token}` } : {} },
+);
+assert((await revokeUser(null)).status === 403, 'signing a user out requires admin');
+assert((await revokeUser(idToken)).status === 403, 'a user may not sign themselves out this way');
+assert((await revokeUser(accessToken)).ok, 'a service account may end a session');
+
+const afterRevoke = await fetch(`${base}/v1/token`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: signIn.refreshToken }),
+});
+assert(afterRevoke.status === 400, 'a revoked session must not refresh');
+console.log('CRED REVOKE ok: a signed-out session cannot refresh');
 
 console.log('ALL JS CREDENTIALS CHECKS PASSED');
 process.exit(0);

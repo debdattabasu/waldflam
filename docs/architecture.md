@@ -250,12 +250,41 @@ one of three places, tried in that order:
    operator believes is working.
 
 Admin is a service account: named, expiring, revocable, and confined to one
-project. Revocation is re-checked on every request behind a 30-second cache,
-so it reaches access tokens already handed out — the alternative, checking
-only at mint time, would leave a leaked credential live until it expired.
-`Bearer owner` and unsigned tokens are not accepted in this mode at all.
-`WALDFLAM_ADMIN_TOKEN` remains as a shared-secret admin and is documented as
-the weaker option, because it names nobody and never expires.
+project. Revocation is re-checked on every request behind a cache, so it
+reaches access tokens already handed out — the alternative, checking only at
+mint time, would leave a leaked credential live until it expired. Revocations
+are also *broadcast*: `revoke_service_account` writes an invalidation notice
+to `_credential_events`, every instance tails it and drops the cached entry,
+and the cache lifetime survives only as the backstop for an instance whose
+change stream has broken. `Bearer owner` and unsigned tokens are not accepted
+in this mode at all. `WALDFLAM_ADMIN_TOKEN` remains as a shared-secret admin
+and is documented as the weaker option, because it names nobody and never
+expires.
+
+**Signing keys rotate.** `_signing_keys` holds the active key under a fixed
+`_id` — which is what makes "create one if none exists" and "swap it" single
+atomic operations — and retired keys under their own id with a
+`retire_after_us`. Rotation is one transaction, so there is never an instant
+with two active keys or none. A retired key keeps verifying until every token
+it could have signed has expired (~75 minutes: an hour of token life plus the
+refresh interval and skew), then is purged. Instances re-read the key set on
+an interval *and* immediately when a token names a key they haven't seen,
+throttled on when a miss last forced a re-read — throttling on load time
+instead would block the very reload a rotation needs. JWKS responses carry
+`Cache-Control: max-age=300`, well inside the retirement window.
+
+**Refresh tokens are opaque and stored** (`_refresh_tokens`, keyed by
+SHA-256 of the token — the token itself is never persisted). A signed refresh
+token cannot be recalled, and a 30-day session that can't be ended is a
+liability; the cost is one read per *refresh*, which is hourly per user rather
+than per request. This is also what keeps key retention at ~75 minutes instead
+of 30 days. Revocation comes in both shapes: one session, or all of a user's
+via `_identities.valid_after_us` — Firebase's `tokensValidAfterTime`, and the
+only way to reject an ID token already handed out. Checking it costs a lookup
+per request, so like Firebase's `checkRevoked` it is opt-in
+(`WALDFLAM_AUTH_CHECK_REVOKED`). One deliberate divergence: `valid_after`
+rounds *up* to the next second, because `auth_time` is whole seconds and
+Firebase resolves the same-second tie in the token's favour.
 
 **Project confinement.** A credential carries the project it was issued for,
 and `Authorization::for_project` narrows it at the two places that know which
@@ -419,7 +448,7 @@ verified mode:
 | `conformance/js` `browser.mjs` | `firebase` (browser build) | WebChannel + REST | the full suite over the closure wire protocol |
 | `conformance/js` `rules.mjs` | `firebase` + admin API | mixed | admin bypass, anonymous/owner allow+deny, `exists()` in rules, `list` enforcement, clear-data |
 | `conformance/js` `triggers.mjs` | `firebase` + local HTTP runtime | mixed | create/update/delete CloudEvents, before/after payloads, path params, non-matching paths |
-| `conformance/js` `credentials.mjs` | `fetch()` + `node:crypto` | REST, **verified mode** | OIDC discovery + JWKS, OAuth2 JWT-bearer exchange, assertion-as-bearer, admin API gating, custom token → ID token, custom claims in rules, refresh, no `owner`/unsigned backdoor |
+| `conformance/js` `credentials.mjs` | `fetch()` + `node:crypto` | REST, **verified mode** | OIDC discovery + JWKS + cache headers, OAuth2 JWT-bearer exchange, assertion-as-bearer, admin API gating, custom token → ID token, custom claims in rules, refresh, session revocation, no `owner`/unsigned backdoor |
 
 Run them with a server up (`docker compose up -d && cargo run --bin waldflam`);
 each prints `ALL … CHECKS PASSED`. Plus `cargo test --workspace` for the unit
@@ -457,8 +486,9 @@ Where the design lives in the code:
 | Rules binding + enforcement | `waldflam-server/src/rules.rs` |
 | Trigger registry + dispatcher | `waldflam-server/src/functions.rs` |
 | Auth: emulator semantics + verified mode | `waldflam-server/src/auth.rs` |
-| Service accounts, token minting, JWKS | `waldflam-server/src/credentials.rs` |
-| Credential records (accounts, signing key) | `waldflam-engine/src/credentials.rs` |
+| Service accounts, token minting, JWKS, rotation | `waldflam-server/src/credentials.rs` |
+| Credential records (accounts, keys, sessions) | `waldflam-engine/src/credentials.rs` |
+| TLS termination (ALPN h2 + http/1.1) | `waldflam-server/src/tls.rs` |
 
 Four things the design didn't anticipate, three found by running real clients
 and one by measuring query plans:

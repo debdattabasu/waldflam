@@ -466,10 +466,16 @@ async fn id_tokens_survive_revocation_unless_checks_are_on() {
     );
 }
 
+/// The signing key is deployment-wide state, so two tests rotating at once
+/// would see each other's keys. Serialised rather than isolated because the
+/// key is genuinely global — pretending otherwise would test a fiction.
+static ROTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Rotation must not be an outage: tokens signed by the old key have to keep
 /// verifying until they expire, and the new key has to take over for signing.
 #[tokio::test]
 async fn rotating_the_signing_key_keeps_old_tokens_working() {
+    let _serialised = ROTATION.lock().await;
     let credentials = credentials().await;
     let before = sign_in(&credentials, "rotate", "erin").await;
     let policy = policy(credentials.clone());
@@ -505,6 +511,7 @@ async fn rotating_the_signing_key_keeps_old_tokens_working() {
 /// would be rejected there for a minute.
 #[tokio::test]
 async fn another_instance_picks_up_a_rotated_key() {
+    let _serialised = ROTATION.lock().await;
     let one = credentials().await;
     let two = credentials().await;
 

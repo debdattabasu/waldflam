@@ -86,11 +86,21 @@ For a deployment anyone can reach:
 ```sh
 WALDFLAM_AUTH=verify
 WALDFLAM_PUBLIC_URL=https://waldflam.example.com   # how clients reach you
+WALDFLAM_TLS_CERT=/etc/waldflam/fullchain.pem      # or WALDFLAM_TLS=terminated
+WALDFLAM_TLS_KEY=/etc/waldflam/privkey.pem         # if a proxy does TLS
 ```
 
 That's the whole configuration. Every token now needs a real RS256 signature,
 the `owner` backdoor is gone, and the `/emulator/v1` endpoints — which load
 rules and erase databases — require admin.
+
+Credentials ride on every request, so waldflam will complain loudly if it's
+verifying them over plaintext. Either give it a certificate — it terminates
+TLS itself, negotiating HTTP/2 for gRPC and HTTP/1.1 for the browser
+surfaces — or set `WALDFLAM_TLS=terminated` to say something in front already
+handles it. (The Firebase SDKs' *emulator* mode is plaintext by definition:
+`connectFirestoreEmulator` forces `http://`. TLS here is for
+production-configured clients and REST callers you control.)
 
 ### Credentials
 
@@ -114,7 +124,8 @@ OAuth2 JWT-bearer grant), or send the assertion straight through as the bearer.
 That gets you a *named*, expiring, revocable, project-scoped admin — where a
 shared secret names nobody, never expires, and needs a restart to rotate.
 Revoking one stops the assertions **and** the access tokens already handed
-out, everywhere, within 30 seconds.
+out, on every instance at once: revocations are broadcast over the same
+change stream that carries writes between instances.
 
 **User identities** work the way Firebase's do. A service account mints a
 custom token for a `uid`; the client trades it in and gets back an ID token
@@ -129,6 +140,29 @@ Custom claims ride along into `request.auth.token`, so rules see them. The
 signing keys are published at `/.well-known/jwks.json` with OIDC discovery at
 `/.well-known/openid-configuration`, which is what lets waldflam verify what
 it issued — and lets anything else verify it too.
+
+Refresh tokens are opaque and stored (only a hash of them, so a database dump
+isn't a set of live sessions), which means sessions can actually be ended:
+
+```sh
+waldflam credentials revoke-user alice --project my-project
+# or, at runtime:
+POST /emulator/v1/projects/my-project/accounts/alice:revokeRefreshTokens
+```
+
+That kills the refresh tokens immediately. ID tokens already issued live out
+their hour unless you set `WALDFLAM_AUTH_CHECK_REVOKED=1`, which checks every
+one against its user's revocation state at the cost of a lookup per request —
+the same tradeoff Firebase makes with `verifyIdToken(token, checkRevoked)`.
+
+The signing key rotates without an outage:
+
+```sh
+waldflam credentials rotate-signing-key
+```
+
+The new key signs from that moment; the old one stays published and keeps
+verifying until every token it signed has expired, then is deleted.
 
 `WALDFLAM_ADMIN_TOKEN` still works as a shared-secret admin if you want one;
 it's documented as the weaker option because it is. To keep using an existing

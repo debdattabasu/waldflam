@@ -138,22 +138,25 @@ These are the ones to fix before calling waldflam production-ready.
 
 ## Operations & ecosystem
 
-- **The signing key can't be rotated.** Storage and the JWKS endpoint both
-  handle a key set, and retired keys would keep verifying tokens already in
-  flight — but nothing promotes a new key or retires the old one. Today
-  rotating means deleting the record, which invalidates every outstanding
-  token at once.
-- **Individual refresh tokens can't be revoked.** They're signed rather than
-  stored, which keeps a database read off the hot path but means the only way
-  to invalidate one before its 30 days are up is to rotate the signing key
-  (see above). A stolen refresh token is therefore long-lived. Fix: a
-  revocation list keyed by uid + issued-at, or stored refresh tokens.
-- **Revocation has a 30-second window.** Service-account lookups are cached
-  for `ACCOUNT_CACHE_TTL`, so a revoked credential keeps working for up to
-  that long on an instance that has seen it recently. Deliberate — the
-  alternative is a MongoDB read per request — but it is a real window, and a
-  deployment that needs immediate revocation would want the cache invalidated
-  through the commit-notice channel instead.
+- **Signing-key rotation is manual.** `waldflam credentials
+  rotate-signing-key` works and doesn't break tokens in flight, but nothing
+  schedules it, so a deployment that never runs it keeps one key forever.
+  Google rotates on the order of days. Fix: an interval-driven rotation, with
+  the same overlap the manual path already implements.
+- **A key rotated away is still readable until it's purged.** Retired keys sit
+  in MongoDB for about 75 minutes so their tokens keep verifying. That's the
+  correct tradeoff for availability, but it does mean "rotate because the key
+  leaked" doesn't take effect immediately. There's no way to say *this key is
+  compromised, drop it now and accept the failed requests* — worth adding.
+- **ID-token revocation checks are off by default.** With
+  `WALDFLAM_AUTH_CHECK_REVOKED` unset, signing a user out leaves their
+  existing ID token working for up to an hour. This matches Firebase, and the
+  cost of turning it on is a lookup per request (cached, and invalidated by
+  broadcast) — but the default is the permissive one, which is worth knowing.
+- **Sessions can't be listed or attributed.** A refresh token record has a
+  uid, a project and a timestamp — no device, IP, or user agent — so there's
+  no "your active sessions" view, and revoking one session means already
+  holding that token. Only "sign out everywhere" is reachable by uid.
 - **Service accounts are project-scoped but not permission-scoped.** A service
   account is admin of its project, full stop; there is no notion of a
   read-only or collection-scoped credential, and OAuth2 `scope` on the
@@ -178,9 +181,15 @@ These are the ones to fix before calling waldflam production-ready.
   can now mint ID tokens with arbitrary custom claims, so this is solved for
   identities it issues; there is still no way to attach server-side roles to a
   uid that an *external* issuer minted.
-- No TLS termination (plaintext h2c only), no rate limiting, no quotas. Note
-  that credentials over plaintext h2c are only as private as the network —
-  put a TLS terminator in front of any deployment that leaves a host.
+- **TLS has no hot reload.** Certificates are read once at startup, so renewal
+  needs a restart. Fine behind a terminator or with a process manager that
+  restarts on renewal; a watcher on the cert path would be better.
+- **No mutual TLS and no client-certificate auth**, so TLS authenticates the
+  server to clients and not the reverse. Service accounts cover the reverse
+  direction, but mTLS is what some deployments expect.
+- No rate limiting and no quotas — including on the token endpoint, which is
+  the one that does public-key verification on unauthenticated input and is
+  therefore the cheapest thing to point load at.
 - No metrics/tracing export; logging is minimal. Authentication failures in
   particular are not counted or sampled, so a credential-stuffing attempt
   looks like nothing at all.
