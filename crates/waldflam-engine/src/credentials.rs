@@ -59,6 +59,63 @@ pub struct CredentialEvent {
 /// A service account was revoked.
 pub const KIND_SERVICE_ACCOUNT: &str = "service_account";
 
+/// A user's sessions were revoked; the selector is `{project}:{uid}`.
+pub const KIND_IDENTITY: &str = "identity";
+
+/// Issued refresh tokens, keyed by hash of the token.
+const REFRESH_TOKENS: &str = "_refresh_tokens";
+
+/// Per-user revocation state.
+const IDENTITIES: &str = "_identities";
+
+/// One issued refresh token.
+///
+/// Stored rather than self-describing, which is the whole point: a signed
+/// refresh token cannot be taken back before it expires, and thirty days is a
+/// long time to be unable to end a session. The cost is one database read per
+/// *refresh* — hourly per user, not per request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenRecord {
+    /// SHA-256 of the token, hex. The token itself is never stored, so a
+    /// database dump cannot be replayed into live sessions — the same reason
+    /// service-account private keys aren't kept either.
+    #[serde(rename = "_id")]
+    pub token_hash: String,
+    pub uid: String,
+    pub project_id: String,
+    pub issued_us: i64,
+    /// TTL anchor; MongoDB reaps the record when the token expires, so
+    /// expiry needs no sweeper of its own.
+    pub expires_at: mongodb::bson::DateTime,
+    pub revoked: bool,
+}
+
+/// Per-user revocation state. Only written when someone revokes, so signing
+/// in costs no extra write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Identity {
+    /// `{project}:{uid}`.
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub project_id: String,
+    pub uid: String,
+    /// Tokens issued before this instant are dead. Firebase calls this
+    /// `tokensValidAfterTime`; it is what lets an *already issued* ID token
+    /// be rejected, since the token itself can't be recalled.
+    pub valid_after_us: i64,
+}
+
+/// Cache and lookup key for an identity.
+pub fn identity_key(project_id: &str, uid: &str) -> String {
+    format!("{project_id}:{uid}")
+}
+
+/// Builds a TTL anchor from a Unix timestamp, so callers don't need to name
+/// MongoDB's date type — storage details stay in this crate.
+pub fn expiry_at(unix_seconds: i64) -> mongodb::bson::DateTime {
+    mongodb::bson::DateTime::from_millis(unix_seconds * 1000)
+}
+
 /// A registered service account.
 ///
 /// waldflam keeps only the *public* half. The private key is handed to the
@@ -184,6 +241,97 @@ impl Store {
             .await?;
         }
         Ok(revoked)
+    }
+
+    fn refresh_tokens(&self) -> Collection<RefreshTokenRecord> {
+        self.db().collection(REFRESH_TOKENS)
+    }
+
+    fn identities(&self) -> Collection<Identity> {
+        self.db().collection(IDENTITIES)
+    }
+
+    /// Records an issued refresh token. The TTL index means expiry is
+    /// MongoDB's job rather than a sweeper of ours.
+    pub async fn store_refresh_token(
+        &self,
+        record: &RefreshTokenRecord,
+    ) -> Result<(), EngineError> {
+        let ttl = mongodb::IndexModel::builder()
+            .keys(doc! { "expires_at": 1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(std::time::Duration::from_secs(0))
+                    .build(),
+            )
+            .build();
+        self.refresh_tokens().create_index(ttl).await?;
+        // Revoking a user's sessions has to find them all.
+        let by_user =
+            mongodb::IndexModel::builder().keys(doc! { "project_id": 1, "uid": 1 }).build();
+        self.refresh_tokens().create_index(by_user).await?;
+        self.refresh_tokens().insert_one(record).await?;
+        Ok(())
+    }
+
+    pub async fn refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<RefreshTokenRecord>, EngineError> {
+        Ok(self.refresh_tokens().find_one(doc! { "_id": token_hash }).await?)
+    }
+
+    /// Revokes one session, leaving the user's others alone.
+    pub async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool, EngineError> {
+        let updated = self
+            .refresh_tokens()
+            .update_one(doc! { "_id": token_hash }, doc! { "$set": { "revoked": true } })
+            .await?;
+        Ok(updated.matched_count > 0)
+    }
+
+    /// Ends every session a user has: existing refresh tokens stop working,
+    /// and `valid_after_us` moves forward so ID tokens already handed out can
+    /// be rejected too.
+    ///
+    /// Publishes an invalidation notice, so instances holding a cached
+    /// `valid_after` drop it rather than waiting out their cache.
+    pub async fn revoke_identity_tokens(
+        &self,
+        project_id: &str,
+        uid: &str,
+        now_us: i64,
+    ) -> Result<(), EngineError> {
+        self.refresh_tokens()
+            .update_many(
+                doc! { "project_id": project_id, "uid": uid },
+                doc! { "$set": { "revoked": true } },
+            )
+            .await?;
+        let id = identity_key(project_id, uid);
+        self.identities()
+            .update_one(
+                doc! { "_id": &id },
+                doc! { "$set": {
+                    "project_id": project_id,
+                    "uid": uid,
+                    "valid_after_us": now_us,
+                } },
+            )
+            .upsert(true)
+            .await?;
+        self.publish_credential_event(KIND_IDENTITY, vec![id]).await?;
+        Ok(())
+    }
+
+    /// A user's revocation state, or `None` if nobody has ever revoked for
+    /// them — which is the common case, and why sign-in writes no record.
+    pub async fn identity(
+        &self,
+        project_id: &str,
+        uid: &str,
+    ) -> Result<Option<Identity>, EngineError> {
+        Ok(self.identities().find_one(doc! { "_id": identity_key(project_id, uid) }).await?)
     }
 
     fn credential_events(&self) -> Collection<CredentialEvent> {

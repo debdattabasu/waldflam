@@ -31,6 +31,8 @@ waldflam — a Firebase-compatible backend
   waldflam credentials create <name>    create a service account, print its key file
   waldflam credentials list             list service accounts
   waldflam credentials revoke <who>     revoke by key id or email
+  waldflam credentials revoke-user <uid>
+                                        end every session a user has
 
 Options for `credentials create`:
   --project <id>   project the credential is admin of (default: WALDFLAM_PROJECT
@@ -49,6 +51,10 @@ Environment:
   WALDFLAM_AUTH_JWKS_URL
   WALDFLAM_ADMIN_TOKEN   shared secret granting admin (weaker than a service
                          account: names nobody, never expires)
+  WALDFLAM_AUTH_CHECK_REVOKED
+                         set to 1 to check every ID token against its user's
+                         revocation state, instead of trusting it until it
+                         expires (costs a lookup per request)
   WALDFLAM_TLS_CERT      PEM certificate chain; with WALDFLAM_TLS_KEY, waldflam
   WALDFLAM_TLS_KEY       terminates TLS itself (ALPN h2 + http/1.1)
   WALDFLAM_TLS           set to `terminated` to acknowledge that something in
@@ -59,7 +65,12 @@ async fn serve() -> anyhow::Result<()> {
     let addr: SocketAddr =
         std::env::var("WALDFLAM_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
     let store = waldflam_engine::store::Store::connect(&mongo_uri()).await?;
-    let credentials = Arc::new(Credentials::new(store.clone(), public_url()));
+    let credentials = Arc::new(
+        Credentials::new(store.clone(), public_url()).with_revocation_checks(
+            std::env::var("WALDFLAM_AUTH_CHECK_REVOKED")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        ),
+    );
     let auth = auth_policy(credentials.clone())?;
     if auth.guards_admin_api() {
         // Force the signing key to exist now: a deployment that cannot mint
@@ -224,6 +235,19 @@ async fn credentials_cli(args: &[String]) -> anyhow::Result<()> {
                     if account.revoked { "\tREVOKED" } else { "" }
                 );
             }
+        }
+        Some("revoke-user") => {
+            let uid = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("usage: waldflam credentials revoke-user <uid> [--project <id>]")
+            })?;
+            let project = flag(args, "--project")
+                .or_else(|| std::env::var("WALDFLAM_PROJECT").ok())
+                .unwrap_or_else(|| "demo".into());
+            credentials
+                .revoke_identity_tokens(&project, uid)
+                .await
+                .map_err(|status| anyhow::anyhow!("{}", status.message()))?;
+            eprintln!("revoked every session for {uid} in {project}");
         }
         Some("revoke") => {
             let selector = args.get(1).ok_or_else(|| {

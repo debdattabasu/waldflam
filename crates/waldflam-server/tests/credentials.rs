@@ -372,3 +372,96 @@ async fn a_revocation_reaches_another_instance_immediately() {
     }
     panic!("revocation did not reach the other instance within 5s, and its cache lasts 300s");
 }
+
+/// Signs a user in and returns the session, for the revocation tests below.
+async fn sign_in(
+    credentials: &Credentials,
+    name: &str,
+    uid: &str,
+) -> waldflam_server::credentials::SignIn {
+    let (_, key_file) =
+        credentials.create_service_account(&unique(name), "demo").await.expect("create");
+    let email = key_file["client_email"].as_str().expect("email");
+    let custom_token = sign(
+        &key_file,
+        serde_json::json!({
+            "iss": email, "sub": email, "aud": CUSTOM_TOKEN_AUDIENCE,
+            "iat": now(), "exp": now() + 3600, "uid": uid,
+        }),
+    );
+    credentials.sign_in_with_custom_token(&custom_token).await.expect("sign in")
+}
+
+/// A refresh token is opaque and stored, so it can actually be taken back —
+/// which a signed one could not be before its thirty days were up.
+#[tokio::test]
+async fn revoking_a_user_ends_their_sessions() {
+    let credentials = credentials().await;
+    let session = sign_in(&credentials, "session", "alice").await;
+
+    assert!(
+        !session.refresh_token.contains('.'),
+        "a refresh token must be opaque, not a JWT anyone can read"
+    );
+    assert!(credentials.refresh(&session.refresh_token).await.is_ok(), "works before revocation");
+
+    credentials.revoke_identity_tokens("demo", "alice").await.expect("revoke");
+
+    assert!(
+        credentials.refresh(&session.refresh_token).await.is_err(),
+        "a revoked session must not be able to refresh"
+    );
+}
+
+/// Revoking one user must not sign out another.
+#[tokio::test]
+async fn revoking_one_user_leaves_others_alone() {
+    let credentials = credentials().await;
+    let alice = sign_in(&credentials, "alice-sess", "alice").await;
+    let bob = sign_in(&credentials, "bob-sess", "bob").await;
+
+    credentials.revoke_identity_tokens("demo", "alice").await.expect("revoke");
+
+    assert!(credentials.refresh(&alice.refresh_token).await.is_err());
+    assert!(credentials.refresh(&bob.refresh_token).await.is_ok(), "bob was not signed out");
+}
+
+/// A refresh token that names nothing must be refused, and must not say
+/// whether it ever named anything.
+#[tokio::test]
+async fn an_unknown_refresh_token_is_refused() {
+    let credentials = credentials().await;
+    let error = credentials.refresh("not-a-real-token").await.expect_err("refused");
+    assert_eq!(error.message(), "refresh token rejected");
+
+    // A revoked one reports the same thing, so a caller cannot tell a token
+    // that was never issued from one that was.
+    let session = sign_in(&credentials, "opaque", "carol").await;
+    credentials.revoke_identity_tokens("demo", "carol").await.expect("revoke");
+    let revoked = credentials.refresh(&session.refresh_token).await.expect_err("refused");
+    assert_eq!(revoked.message(), error.message());
+}
+
+/// Firebase's tradeoff, and now ours: an ID token already handed out stays
+/// valid until it expires unless the server is asked to check.
+#[tokio::test]
+async fn id_tokens_survive_revocation_unless_checks_are_on() {
+    let relaxed = credentials().await;
+    let session = sign_in(&relaxed, "relaxed", "dave").await;
+    relaxed.revoke_identity_tokens("demo", "dave").await.expect("revoke");
+    assert!(
+        judge(&policy(relaxed.clone()), &session.id_token).await.is_ok(),
+        "by default an issued ID token lives out its hour, as in Firebase"
+    );
+
+    // Same token, a server that checks.
+    let strict = Arc::new(
+        credentials_with_ttl(std::time::Duration::from_millis(1))
+            .await
+            .with_revocation_checks(true),
+    );
+    assert!(
+        judge(&policy(strict), &session.id_token).await.is_err(),
+        "with revocation checks on, a signed-out user's ID token must be refused"
+    );
+}

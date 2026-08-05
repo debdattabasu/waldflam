@@ -59,6 +59,10 @@ pub async fn serve(
             axum::routing::delete(rest::clear_data),
         )
         .route("/emulator/v1/projects/{project}/triggers", axum::routing::put(rest::set_triggers))
+        .route(
+            "/emulator/v1/projects/{project}/accounts/{uid}",
+            axum::routing::post(rest::revoke_refresh_tokens),
+        )
         .with_state(rest_state.clone());
     let router = grpc
         .into_axum_router()

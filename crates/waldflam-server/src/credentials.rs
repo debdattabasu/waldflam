@@ -26,7 +26,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt as _;
 use rsa::traits::PublicKeyParts as _;
 use tonic::Status;
-use waldflam_engine::credentials::{ACTIVE_SIGNING_KEY, ServiceAccount, SigningKey};
+use waldflam_engine::credentials::{
+    ACTIVE_SIGNING_KEY, RefreshTokenRecord, ServiceAccount, SigningKey, identity_key,
+};
 use waldflam_engine::store::Store;
 
 /// Lifetime of a minted access token. Short on purpose: an access token is
@@ -40,6 +42,10 @@ const ID_TOKEN_TTL: i64 = 3600;
 
 /// Lifetime of a refresh token.
 const REFRESH_TOKEN_TTL: i64 = 30 * 24 * 3600;
+
+/// Bytes of randomness in a refresh token. Opaque rather than signed, so
+/// unguessability is the entire security property.
+const REFRESH_TOKEN_BYTES: usize = 32;
 
 /// Longest assertion we will honour. A client that signs a year-long
 /// assertion has effectively minted a bearer secret; capping the window keeps
@@ -98,12 +104,20 @@ pub struct Credentials {
     issuer: String,
     signing: tokio::sync::OnceCell<Signing>,
     accounts: RwLock<HashMap<String, CachedAccount>>,
+    /// `{project}:{uid}` → when that user's tokens stopped counting.
+    identities: RwLock<HashMap<String, CachedValidAfter>>,
     account_cache_ttl: Duration,
+    check_revoked: bool,
 }
 
 struct CachedAccount {
     at: Instant,
     account: Option<ServiceAccount>,
+}
+
+struct CachedValidAfter {
+    at: Instant,
+    valid_after_us: i64,
 }
 
 /// Loaded signing material for the deployment key.
@@ -133,8 +147,22 @@ impl Credentials {
             issuer: issuer.trim_end_matches('/').to_owned(),
             signing: tokio::sync::OnceCell::new(),
             accounts: RwLock::new(HashMap::new()),
+            identities: RwLock::new(HashMap::new()),
             account_cache_ttl: ACCOUNT_CACHE_TTL,
+            check_revoked: false,
         }
+    }
+
+    /// Checks every ID token against its user's revocation state, instead of
+    /// trusting it until it expires.
+    ///
+    /// Off by default, matching Firebase: `verifyIdToken` ignores revocation
+    /// unless asked, because the check costs a lookup on every request and an
+    /// ID token only lives an hour. Turn it on when an hour is too long to
+    /// wait for a sign-out to bite.
+    pub fn with_revocation_checks(mut self, check: bool) -> Self {
+        self.check_revoked = check;
+        self
     }
 
     /// Overrides how long credential lookups are cached.
@@ -150,10 +178,16 @@ impl Credentials {
 
     /// Drops whatever is cached for these selectors, so the next request
     /// re-reads them.
+    ///
+    /// Both caches are cleared regardless of what the selector names: a key
+    /// id, an email and a `{project}:{uid}` can't collide, so matching on the
+    /// event's kind would only add a way to get it wrong.
     fn forget(&self, selectors: &[String]) {
-        let mut cache = self.accounts.write().expect("account cache");
+        let mut accounts = self.accounts.write().expect("account cache");
+        let mut identities = self.identities.write().expect("identity cache");
         for selector in selectors {
-            cache.remove(selector);
+            accounts.remove(selector);
+            identities.remove(selector);
         }
     }
 
@@ -397,7 +431,19 @@ impl Credentials {
                     project_id: account.project_id,
                 })
             }
-            Some("id") => Ok(Resolved::User { uid: subject, project_id: audience, claims }),
+            Some("id") => {
+                if self.check_revoked {
+                    // `auth_time` is when the identity was established, which
+                    // is what a revocation is compared against — `iat` would
+                    // let a refresh mint a token that outlived the sign-out.
+                    let auth_time = claim_i64(&claims, "auth_time").unwrap_or_default();
+                    let valid_after = self.valid_after_us(&audience, &subject).await?;
+                    if auth_time * 1_000_000 < valid_after {
+                        return Err(Status::unauthenticated("token revoked"));
+                    }
+                }
+                Ok(Resolved::User { uid: subject, project_id: audience, claims })
+            }
             // A refresh token is for the refresh endpoint only. Accepting it
             // as a credential would hand out a month-long session token.
             other => {
@@ -550,16 +596,24 @@ impl Credentials {
         );
 
         let id_token = self.sign(serde_json::Value::Object(claims)).await?;
-        let refresh_token = self
-            .sign(serde_json::json!({
-                "iss": self.issuer,
-                "sub": uid,
-                "aud": project_id,
-                KIND_CLAIM: "refresh",
-                "iat": now,
-                "exp": now + REFRESH_TOKEN_TTL,
-            }))
-            .await?;
+
+        // Opaque and stored, not signed. A signed refresh token cannot be
+        // taken back before it expires, and thirty days is a long time to be
+        // unable to end a session; the cost is a lookup per refresh, which
+        // happens hourly per user rather than per request.
+        let refresh_token = random_token();
+        self.store
+            .store_refresh_token(&RefreshTokenRecord {
+                token_hash: hash_token(&refresh_token),
+                uid: uid.to_owned(),
+                project_id: project_id.to_owned(),
+                issued_us: now * 1_000_000,
+                expires_at: waldflam_engine::credentials::expiry_at(now + REFRESH_TOKEN_TTL),
+                revoked: false,
+            })
+            .await
+            .map_err(engine_status)?;
+
         Ok(SignIn {
             id_token,
             refresh_token,
@@ -571,38 +625,85 @@ impl Credentials {
 
     /// Trades a refresh token for a fresh ID token.
     ///
-    /// Refresh tokens are signed rather than stored, which keeps the hot path
-    /// free of a database read but means an individual one cannot be revoked
-    /// before it expires — only the signing key can be rotated. Recorded in
-    /// backlog.md rather than papered over.
+    /// The presented token is hashed and looked up; a revoked or unknown one
+    /// is refused. Returning the *same* refresh token matches Firebase and
+    /// keeps clients from having to track rotation.
     pub async fn refresh(&self, refresh_token: &str) -> Result<SignIn, Status> {
-        let signing = self.signing().await?;
-        let header = jsonwebtoken::decode_header(refresh_token)
-            .map_err(|e| Status::unauthenticated(format!("invalid refresh token: {e}")))?;
-        let key = header
-            .kid
-            .as_deref()
-            .and_then(|kid| signing.verifying.get(kid))
-            .ok_or_else(|| Status::unauthenticated("refresh token was not issued here"))?;
-
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-        validation.set_issuer(&[&self.issuer]);
-        validation.set_required_spec_claims(&["exp", "iss", "sub"]);
-        validation.validate_aud = false;
-        validation.leeway = CLOCK_LEEWAY_SECONDS;
-        let decoded = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
-            refresh_token,
-            key,
-            &validation,
-        )
-        .map_err(|e| Status::unauthenticated(format!("refresh token rejected: {e}")))?;
-        let claims = decoded.claims;
-        if claims.get(KIND_CLAIM).and_then(|v| v.as_str()) != Some("refresh") {
-            return Err(Status::unauthenticated("not a refresh token"));
+        let record = self
+            .store
+            .refresh_token(&hash_token(refresh_token))
+            .await
+            .map_err(engine_status)?
+            // Deliberately the same message for "never existed" and
+            // "revoked": a caller holding a bad token learns only that it is
+            // bad, not whether it ever named a real session.
+            .ok_or_else(|| Status::unauthenticated("refresh token rejected"))?;
+        if record.revoked {
+            return Err(Status::unauthenticated("refresh token rejected"));
         }
-        let uid = claims.get("sub").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-        let project_id = claims.get("aud").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
-        self.issue_identity(&project_id, &uid, &serde_json::Map::new()).await
+        // MongoDB's TTL monitor runs on its own schedule, so an expired
+        // record can outlive its expiry by minutes. Check the time here
+        // rather than trusting the sweeper to be punctual.
+        if record.issued_us / 1_000_000 + REFRESH_TOKEN_TTL < now_seconds() {
+            return Err(Status::unauthenticated("refresh token rejected"));
+        }
+
+        let mut signed_in =
+            self.issue_identity(&record.project_id, &record.uid, &serde_json::Map::new()).await?;
+        // Hand back the token the caller already has rather than the freshly
+        // minted one, so refreshing doesn't quietly orphan sessions.
+        self.store
+            .revoke_refresh_token(&hash_token(&signed_in.refresh_token))
+            .await
+            .map_err(engine_status)?;
+        signed_in.refresh_token = refresh_token.to_owned();
+        Ok(signed_in)
+    }
+
+    /// Ends every session a user has.
+    ///
+    /// Firebase's `revokeRefreshTokens(uid)`: refresh tokens stop working at
+    /// once, and ID tokens already issued are rejected too — but only where
+    /// [`Credentials::with_revocation_checks`] is on, because otherwise
+    /// nothing looks.
+    pub async fn revoke_identity_tokens(&self, project_id: &str, uid: &str) -> Result<(), Status> {
+        // Rounded *up* to the next second, deliberately.
+        //
+        // `auth_time` is a whole number of seconds, so a token minted in the
+        // same second as the revocation compares equal. Firebase resolves
+        // that tie in the token's favour and documents waiting a second
+        // before trusting a revocation; erring the other way costs a user at
+        // most one second of not being able to sign back in, and closes a
+        // window in which a token issued *before* the revocation survives it.
+        let valid_after_us = (now_seconds() + 1) * 1_000_000;
+        self.store
+            .revoke_identity_tokens(project_id, uid, valid_after_us)
+            .await
+            .map_err(engine_status)?;
+        self.forget(&[identity_key(project_id, uid)]);
+        Ok(())
+    }
+
+    /// When this user's tokens stopped counting; `0` if never revoked.
+    async fn valid_after_us(&self, project_id: &str, uid: &str) -> Result<i64, Status> {
+        let key = identity_key(project_id, uid);
+        if let Some(hit) = self.identities.read().expect("identity cache").get(&key)
+            && hit.at.elapsed() < self.account_cache_ttl
+        {
+            return Ok(hit.valid_after_us);
+        }
+        let valid_after_us = self
+            .store
+            .identity(project_id, uid)
+            .await
+            .map_err(engine_status)?
+            .map(|identity| identity.valid_after_us)
+            .unwrap_or_default();
+        self.identities
+            .write()
+            .expect("identity cache")
+            .insert(key, CachedValidAfter { at: Instant::now(), valid_after_us });
+        Ok(valid_after_us)
     }
 
     async fn sign(&self, claims: serde_json::Value) -> Result<String, Status> {
@@ -668,12 +769,28 @@ pub fn spawn_invalidation_watcher(credentials: std::sync::Arc<Credentials>) {
 }
 
 /// The result of signing in: what the identitytoolkit response carries.
+///
+/// `Debug` is written out rather than derived so the tokens never reach a log
+/// line: both fields are live credentials, and a struct that prints itself is
+/// one `dbg!` away from leaking a session.
 pub struct SignIn {
     pub id_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
     pub uid: String,
     pub project_id: String,
+}
+
+impl std::fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignIn")
+            .field("uid", &self.uid)
+            .field("project_id", &self.project_id)
+            .field("expires_in", &self.expires_in)
+            .field("id_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Signing {
@@ -755,6 +872,25 @@ fn generate_key() -> Result<GeneratedKey, Status> {
         modulus: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
         exponent: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
     })
+}
+
+/// An opaque refresh token: unguessable randomness, nothing else.
+fn random_token() -> String {
+    use rand::RngCore as _;
+    let mut bytes = [0u8; REFRESH_TOKEN_BYTES];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// What gets stored in place of a refresh token.
+///
+/// A plain SHA-256 with no salt or stretching, which would be wrong for a
+/// password and is right here: the input is 32 bytes of uniform randomness,
+/// so there is no dictionary to attack and nothing for a salt to defend.
+fn hash_token(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn random_id() -> String {

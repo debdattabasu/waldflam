@@ -401,6 +401,27 @@ pub async fn set_triggers(
     }
 }
 
+/// `POST /emulator/v1/projects/{project}/accounts/{uid}:revokeRefreshTokens`
+/// — ends every session a user has, the way Firebase's
+/// `revokeRefreshTokens(uid)` does.
+///
+/// Admin-gated: being able to sign anyone out is exactly as sensitive as
+/// being able to sign them in.
+pub async fn revoke_refresh_tokens(
+    State(state): State<RestState>,
+    Path((project, uid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = require_admin(&state, &headers, &project).await {
+        return denied;
+    }
+    let uid = uid.trim_end_matches(":revokeRefreshTokens");
+    match state.credentials.revoke_identity_tokens(&project, uid).await {
+        Ok(()) => json_ok(serde_json::json!({ "localId": uid })),
+        Err(status) => status_response(&status),
+    }
+}
+
 /// `DELETE /emulator/v1/projects/{project}/databases/{db}/documents` —
 /// clears all data (test-harness reset).
 pub async fn clear_data(
