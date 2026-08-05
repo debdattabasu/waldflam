@@ -180,8 +180,17 @@ pub struct SigningKey {
     pub role: String,
     /// Published as the JWK `kid`, and set on the header of tokens we sign.
     pub key_id: String,
-    /// PKCS#8 PEM.
+    /// PKCS#8 PEM, when the deployment stores keys in the clear. Empty once
+    /// `sealed_key` is set.
+    #[serde(default)]
     pub private_key_pem: String,
+    /// The same PEM under a key-encryption key, when one is configured.
+    ///
+    /// Exactly one of these two is populated. Both being empty is a record
+    /// that cannot sign, which the loader treats as an error rather than
+    /// quietly generating a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_key: Option<SealedKey>,
     pub modulus: String,
     pub exponent: String,
     pub created_us: i64,
@@ -190,6 +199,26 @@ pub struct SigningKey {
     /// has expired, or rotating would invalidate tokens already in flight.
     #[serde(default)]
     pub retire_after_us: i64,
+}
+
+/// A private key encrypted with a key-encryption key held outside the
+/// database.
+///
+/// The point is narrow and worth stating exactly: this puts the signing key
+/// beyond anyone who can *read the database without being on the waldflam
+/// host* — backups, snapshots, a managed provider's staff, a leaked
+/// connection string, an exposed port. It does nothing against an attacker
+/// with the host itself, who has the key-encryption key too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedKey {
+    /// Identifies the key-encryption key, so "sealed with a different KEK"
+    /// can be reported as such instead of as a generic decryption failure.
+    pub kek_id: String,
+    /// AES-256-GCM nonce, base64. Fresh per sealing — reusing one under the
+    /// same key is what breaks GCM.
+    pub nonce: String,
+    /// Ciphertext with its authentication tag, base64.
+    pub ciphertext: String,
 }
 
 impl Store {
@@ -508,6 +537,27 @@ impl Store {
         keys.insert_one(candidate).session(&mut session).await?;
         session.commit_transaction().await?;
         Ok(candidate.clone())
+    }
+
+    /// Replaces a stored key's plaintext PEM with its sealed form.
+    ///
+    /// Unsets `private_key_pem` in the same update, so there is no moment
+    /// where the row holds both — leaving the plaintext behind would make
+    /// the encryption decorative.
+    pub async fn seal_signing_key(
+        &self,
+        role: &str,
+        sealed: &SealedKey,
+    ) -> Result<(), EngineError> {
+        let sealed = mongodb::bson::to_bson(sealed)
+            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        self.signing_keys()
+            .update_one(
+                doc! { "_id": role },
+                doc! { "$set": { "sealed_key": sealed, "private_key_pem": "" } },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Deletes retired keys whose tokens have all expired. Nothing verifies

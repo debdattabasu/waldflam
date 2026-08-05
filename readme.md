@@ -161,6 +161,34 @@ it's sent as a bearer token, because that flow reuses a single assertion for
 its whole lifetime by design. Set `WALDFLAM_AUTH_REQUIRE_JTI=1` to refuse
 exchanges without one, if your clients all send them.
 
+### Where the signing key lives
+
+waldflam holds the private half of its signing key — it has to, to mint
+anything — so by default anyone who can read the database can mint any
+identity. You can encrypt it at rest under a key held outside:
+
+```sh
+waldflam credentials generate-kek > /etc/waldflam/kek   # keep this elsewhere
+WALDFLAM_KEK_FILE=/etc/waldflam/kek
+waldflam credentials seal-signing-key                   # once, to adopt it
+```
+
+**Be precise about what that buys.** It puts the key beyond everyone who can
+read the database *without being on the waldflam host*: backups (which are
+dumps by definition and outlive the key, since rotation is manual), volume
+snapshots, a managed provider's operators, a leaked connection string, an
+exposed port. It does **nothing** against an attacker who has the host — the
+key-encryption key is right there. Root on the host reads tokens in flight
+anyway, so it defeats essentially every design here and isn't the target.
+
+So it's worth most when your database is further away than your host —
+managed MongoDB, cloud backups, a provider you don't operate — and least on
+one machine you own outright, where those are the same people.
+
+waldflam refuses to start if the stored key is sealed and no key-encryption
+key is configured, and says so distinctly if the configured one is the wrong
+one rather than reporting an indistinguishable decryption failure.
+
 The signing key rotates without an outage:
 
 ```sh

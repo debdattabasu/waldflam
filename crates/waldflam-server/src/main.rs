@@ -36,6 +36,8 @@ waldflam — a Firebase-compatible backend
   waldflam credentials rotate-signing-key
                                         sign with a new key; the old one keeps
                                         verifying until its tokens expire
+  waldflam credentials generate-kek     print a new key-encryption key
+  waldflam credentials seal-signing-key encrypt the stored signing key under it
 
 Options for `credentials create`:
   --project <id>   project the credential is admin of (default: WALDFLAM_PROJECT
@@ -45,6 +47,8 @@ Options for `credentials create`:
 Environment:
   WALDFLAM_LISTEN        address to serve on (default 0.0.0.0:8080)
   WALDFLAM_MONGO         MongoDB URI
+  WALDFLAM_MONGO_DATABASE
+                         database within it (default `waldflam`)
   WALDFLAM_PUBLIC_URL    externally reachable base URL; identifies this
                          deployment as a token issuer and is baked into the
                          key files it emits (default http://127.0.0.1:8080)
@@ -63,6 +67,10 @@ Environment:
                          which are the ones replay protection cannot cover.
                          Only for deployments that control their clients — not
                          every Google auth library sends one
+  WALDFLAM_KEK           base64 key-encryption key: encrypts the signing key at
+  WALDFLAM_KEK_FILE      rest, so a database dump (or a backup, or a snapshot)
+                         yields nothing usable. The file form keeps it out of
+                         the process environment. Set one, not both
   WALDFLAM_TLS_CERT      PEM certificate chain; with WALDFLAM_TLS_KEY, waldflam
   WALDFLAM_TLS_KEY       terminates TLS itself (ALPN h2 + http/1.1)
   WALDFLAM_TLS           set to `terminated` to acknowledge that something in
@@ -72,11 +80,12 @@ Environment:
 async fn serve() -> anyhow::Result<()> {
     let addr: SocketAddr =
         std::env::var("WALDFLAM_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
-    let store = waldflam_engine::store::Store::connect(&mongo_uri()).await?;
+    let store = connect().await?;
     let credentials = Arc::new(
         Credentials::new(store.clone(), public_url())
             .with_revocation_checks(enabled("WALDFLAM_AUTH_CHECK_REVOKED"))
-            .with_required_jti(enabled("WALDFLAM_AUTH_REQUIRE_JTI")),
+            .with_required_jti(enabled("WALDFLAM_AUTH_REQUIRE_JTI"))
+            .with_kek(waldflam_server::sealing::from_env()?),
     );
     let auth = auth_policy(credentials.clone())?;
     if auth.guards_admin_api() {
@@ -121,6 +130,17 @@ fn enabled(name: &str) -> bool {
 fn mongo_uri() -> String {
     std::env::var("WALDFLAM_MONGO")
         .unwrap_or_else(|_| "mongodb://127.0.0.1:27017/?directConnection=true".into())
+}
+
+/// MongoDB database to use, so independent deployments can share a cluster
+/// without sharing documents, credentials or signing keys.
+fn mongo_database() -> String {
+    std::env::var("WALDFLAM_MONGO_DATABASE")
+        .unwrap_or_else(|_| waldflam_engine::store::DEFAULT_DATABASE.to_owned())
+}
+
+async fn connect() -> anyhow::Result<waldflam_engine::store::Store> {
+    Ok(waldflam_engine::store::Store::connect_to(&mongo_uri(), &mongo_database()).await?)
 }
 
 /// How this deployment names itself as a token issuer.
@@ -200,8 +220,9 @@ fn external_issuer() -> anyhow::Result<Option<ExternalIssuer>> {
 /// credential. Whoever can reach the database can mint one, and they could
 /// have written the record by hand anyway.
 async fn credentials_cli(args: &[String]) -> anyhow::Result<()> {
-    let store = waldflam_engine::store::Store::connect(&mongo_uri()).await?;
-    let credentials = Credentials::new(store, public_url());
+    let store = connect().await?;
+    let credentials =
+        Credentials::new(store, public_url()).with_kek(waldflam_server::sealing::from_env()?);
 
     match args.first().map(String::as_str) {
         Some("create") => {
@@ -248,6 +269,20 @@ async fn credentials_cli(args: &[String]) -> anyhow::Result<()> {
                 );
             }
         }
+        Some("generate-kek") => {
+            // To stdout alone, so it can be piped into a secret store
+            // without the surrounding prose coming along.
+            println!("{}", waldflam_server::sealing::Kek::generate());
+            eprintln!(
+                "Store this outside the database and pass it as WALDFLAM_KEK, or better \
+                 WALDFLAM_KEK_FILE.\nLose it and a sealed signing key cannot be recovered."
+            );
+        }
+        Some("seal-signing-key") => match credentials.seal_signing_key().await {
+            Ok(true) => eprintln!("signing key sealed; the plaintext copy is gone"),
+            Ok(false) => eprintln!("nothing to do — the signing key is already sealed"),
+            Err(status) => return Err(anyhow::anyhow!("{}", status.message())),
+        },
         Some("rotate-signing-key") => {
             let key_id = credentials
                 .rotate_signing_key()

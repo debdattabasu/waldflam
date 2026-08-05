@@ -4,6 +4,7 @@ pub mod functions;
 pub mod listen;
 pub mod rest;
 pub mod rules;
+pub mod sealing;
 pub mod service;
 pub mod tls;
 pub mod webchannel;

@@ -640,3 +640,85 @@ async fn assertions_without_a_jti_are_allowed_unless_required() {
     let error = strict.exchange_assertion(&without).await.expect_err("refused when required");
     assert!(error.message().contains("jti"), "{}", error.message());
 }
+
+/// A sealed deployment must work exactly like an unsealed one from the
+/// outside, and must leave nothing usable in the database.
+///
+/// Runs against its own MongoDB database: sealing changes deployment-wide
+/// key material, and doing that in the shared one would leave every other
+/// test unable to read the signing key.
+#[tokio::test]
+async fn a_sealed_signing_key_still_signs_and_verifies() {
+    let mongo = std::env::var("WALDFLAM_TEST_MONGO")
+        .unwrap_or_else(|_| "mongodb://127.0.0.1:27017/?directConnection=true".into());
+    let database = unique("wf-sealed");
+    let open = |kek: Option<&str>| {
+        let (mongo, database) = (mongo.clone(), database.clone());
+        let kek = kek.map(str::to_owned);
+        async move {
+            let store = waldflam_engine::store::Store::connect_to(&mongo, &database)
+                .await
+                .expect("MongoDB not reachable — run `docker compose up -d`");
+            Arc::new(Credentials::new(store, ISSUER.into()).with_kek(
+                kek.map(|k| waldflam_server::sealing::Kek::from_base64(&k).expect("kek")),
+            ))
+        }
+    };
+
+    let kek = waldflam_server::sealing::Kek::generate();
+    let sealed = open(Some(&kek)).await;
+    let session = sign_in(&sealed, "sealed", "heidi").await;
+    let auth = judge(&policy(sealed.clone()), &session.id_token).await.expect("verifies");
+    assert!(matches!(auth, Authorization::User(_)));
+
+    // Whoever holds the database but not the key-encryption key gets nothing.
+    let blind = open(None).await;
+    let error = blind.jwks().await.expect_err("a sealed key must not load without the KEK");
+    assert!(error.message().contains("sealed"), "{}", error.message());
+
+    // And the wrong one is refused distinguishably, so an operator isn't
+    // sent hunting for corruption.
+    let wrong = open(Some(&waldflam_server::sealing::Kek::generate())).await;
+    let error = wrong.jwks().await.expect_err("the wrong KEK must not open it");
+    assert!(error.message().contains("different key-encryption key"), "{}", error.message());
+}
+
+/// Turning sealing on for a deployment that already has a plaintext key.
+#[tokio::test]
+async fn an_existing_key_can_be_sealed_in_place() {
+    let mongo = std::env::var("WALDFLAM_TEST_MONGO")
+        .unwrap_or_else(|_| "mongodb://127.0.0.1:27017/?directConnection=true".into());
+    let database = unique("wf-adopt");
+    let open = |kek: Option<&str>| {
+        let (mongo, database) = (mongo.clone(), database.clone());
+        let kek = kek.map(str::to_owned);
+        async move {
+            let store = waldflam_engine::store::Store::connect_to(&mongo, &database)
+                .await
+                .expect("MongoDB not reachable");
+            Arc::new(Credentials::new(store, ISSUER.into()).with_kek(
+                kek.map(|k| waldflam_server::sealing::Kek::from_base64(&k).expect("kek")),
+            ))
+        }
+    };
+
+    // Start unsealed, and mint something so there is a key to protect.
+    let plain = open(None).await;
+    let before = sign_in(&plain, "adopt", "ivan").await;
+
+    let kek = waldflam_server::sealing::Kek::generate();
+    let adopting = open(Some(&kek)).await;
+    assert!(adopting.seal_signing_key().await.expect("seal"), "there was a key to seal");
+    assert!(
+        !adopting.seal_signing_key().await.expect("seal again"),
+        "sealing twice must be a no-op, not a second layer"
+    );
+
+    // The same key, now encrypted: tokens minted before still verify.
+    assert!(
+        judge(&policy(adopting.clone()), &before.id_token).await.is_ok(),
+        "sealing must not change the key, only how it is stored"
+    );
+    // And the plaintext is gone.
+    assert!(open(None).await.jwks().await.is_err(), "the plaintext copy must not remain");
+}

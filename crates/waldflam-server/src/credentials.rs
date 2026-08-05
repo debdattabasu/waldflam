@@ -134,6 +134,8 @@ pub struct Credentials {
     account_cache_ttl: Duration,
     check_revoked: bool,
     require_jti: bool,
+    /// Seals the signing key at rest when set. See `sealing`.
+    kek: Option<crate::sealing::Kek>,
 }
 
 struct CachedAccount {
@@ -183,7 +185,17 @@ impl Credentials {
             account_cache_ttl: ACCOUNT_CACHE_TTL,
             check_revoked: false,
             require_jti: false,
+            kek: None,
         }
+    }
+
+    /// Encrypts the signing key at rest under this key-encryption key.
+    ///
+    /// Changes what a database dump is worth, and nothing else — see the
+    /// `sealing` module for what that does and does not cover.
+    pub fn with_kek(mut self, kek: Option<crate::sealing::Kek>) -> Self {
+        self.kek = kek;
+        self
     }
 
     /// Refuses one-shot assertions that carry no `jti`, instead of letting
@@ -265,7 +277,7 @@ impl Credentials {
         {
             return Ok(cached.signing.clone());
         }
-        let signing = std::sync::Arc::new(Signing::load(&self.store).await?);
+        let signing = std::sync::Arc::new(Signing::load(&self.store, self.kek.as_ref()).await?);
         *slot = Some(CachedSigning { at: Instant::now(), signing: signing.clone() });
         Ok(signing)
     }
@@ -301,9 +313,36 @@ impl Credentials {
             }
             *last = Some(Instant::now());
         }
-        let reloaded = std::sync::Arc::new(Signing::load(&self.store).await?);
+        let reloaded = std::sync::Arc::new(Signing::load(&self.store, self.kek.as_ref()).await?);
         *slot = Some(CachedSigning { at: Instant::now(), signing: reloaded.clone() });
         Ok(reloaded)
+    }
+
+    /// Encrypts an existing plaintext signing key under the configured KEK,
+    /// in place.
+    ///
+    /// Separate from startup on purpose: rewriting key material is not
+    /// something a server should do because it happened to boot with a new
+    /// environment variable. Returns whether anything needed doing.
+    pub async fn seal_signing_key(&self) -> Result<bool, Status> {
+        let Some(kek) = self.kek.as_ref() else {
+            return Err(Status::failed_precondition(
+                "no key-encryption key is configured — set WALDFLAM_KEK or WALDFLAM_KEK_FILE",
+            ));
+        };
+        let keys = self.store.all_signing_keys().await.map_err(engine_status)?;
+        let mut sealed_any = false;
+        for key in keys {
+            if key.sealed_key.is_some() || key.private_key_pem.is_empty() {
+                continue;
+            }
+            let sealed =
+                kek.seal(&key.private_key_pem).map_err(|e| Status::internal(e.to_string()))?;
+            self.store.seal_signing_key(&key.role, &sealed).await.map_err(engine_status)?;
+            sealed_any = true;
+        }
+        *self.signing.write().await = None;
+        Ok(sealed_any)
     }
 
     /// Retires the current signing key and starts signing with a new one.
@@ -312,17 +351,8 @@ impl Credentials {
     /// expired; anything shorter would invalidate tokens already in
     /// circulation, which is an outage rather than a rotation.
     pub async fn rotate_signing_key(&self) -> Result<String, Status> {
-        let generated = generate_key()?;
+        let candidate = new_signing_key(ACTIVE_SIGNING_KEY, self.kek.as_ref())?;
         let now = now_seconds();
-        let candidate = SigningKey {
-            role: ACTIVE_SIGNING_KEY.into(),
-            key_id: random_id(),
-            private_key_pem: generated.private_key_pem,
-            modulus: generated.modulus,
-            exponent: generated.exponent,
-            created_us: now * 1_000_000,
-            retire_after_us: 0,
-        };
         let retire_after_us = (now + RETIRED_KEY_GRACE) * 1_000_000;
         let rotated = self
             .store
@@ -986,22 +1016,13 @@ impl Signing {
     /// Loads the deployment key, generating one the first time any instance
     /// needs it. The insert is atomic, so instances racing at first boot end
     /// up sharing a key rather than each minting tokens the others reject.
-    async fn load(store: &Store) -> Result<Self, Status> {
+    async fn load(store: &Store, kek: Option<&crate::sealing::Kek>) -> Result<Self, Status> {
         let existing = store.all_signing_keys().await.map_err(engine_status)?;
         let active = match existing.iter().find(|key| key.role == ACTIVE_SIGNING_KEY) {
             Some(key) => key.clone(),
             None => {
                 tracing::info!("credentials: generating this deployment's signing key");
-                let generated = generate_key()?;
-                let candidate = SigningKey {
-                    role: ACTIVE_SIGNING_KEY.into(),
-                    key_id: random_id(),
-                    private_key_pem: generated.private_key_pem,
-                    modulus: generated.modulus,
-                    exponent: generated.exponent,
-                    created_us: now_seconds() * 1_000_000,
-                    retire_after_us: 0,
-                };
+                let candidate = new_signing_key(ACTIVE_SIGNING_KEY, kek)?;
                 store.signing_key_or_insert(&candidate).await.map_err(engine_status)?
             }
         };
@@ -1028,14 +1049,72 @@ impl Signing {
             }));
         }
 
+        let pem = private_key_of(&active, kek)?;
         Ok(Self {
             key_id: active.key_id.clone(),
-            encoding: jsonwebtoken::EncodingKey::from_rsa_pem(active.private_key_pem.as_bytes())
+            encoding: jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
                 .map_err(|e| Status::internal(format!("stored signing key unusable: {e}")))?,
             verifying,
             jwks: serde_json::json!({ "keys": jwks }),
         })
     }
+}
+
+/// Recovers a stored key's PEM, decrypting it if it was sealed.
+///
+/// The mismatch cases are errors rather than fallbacks on purpose: a server
+/// that quietly generated a replacement when it could not read the existing
+/// key would invalidate every token in circulation and look like it had
+/// worked.
+fn private_key_of(key: &SigningKey, kek: Option<&crate::sealing::Kek>) -> Result<String, Status> {
+    match (&key.sealed_key, kek) {
+        (Some(sealed), Some(kek)) => {
+            kek.unseal(sealed).map_err(|e| Status::internal(e.to_string()))
+        }
+        (Some(_), None) => Err(Status::internal(
+            "this deployment's signing key is sealed, but no key-encryption key is \
+             configured — set WALDFLAM_KEK or WALDFLAM_KEK_FILE",
+        )),
+        (None, _) if key.private_key_pem.is_empty() => {
+            Err(Status::internal("the stored signing key has no key material"))
+        }
+        (None, Some(_)) => {
+            // Not an error: a deployment that has just turned sealing on
+            // still has a plaintext key, and refusing to start would be a
+            // hostile way to greet the change.
+            tracing::warn!(
+                "credentials: a key-encryption key is configured but the signing key is \
+                 still stored in the clear — run `waldflam credentials seal-signing-key`"
+            );
+            Ok(key.private_key_pem.clone())
+        }
+        (None, None) => Ok(key.private_key_pem.clone()),
+    }
+}
+
+/// Generates a signing key ready to store, sealed when a KEK is configured.
+fn new_signing_key(role: &str, kek: Option<&crate::sealing::Kek>) -> Result<SigningKey, Status> {
+    let generated = generate_key()?;
+    let (private_key_pem, sealed_key) = match kek {
+        Some(kek) => (
+            String::new(),
+            Some(
+                kek.seal(&generated.private_key_pem)
+                    .map_err(|e| Status::internal(e.to_string()))?,
+            ),
+        ),
+        None => (generated.private_key_pem, None),
+    };
+    Ok(SigningKey {
+        role: role.to_owned(),
+        key_id: random_id(),
+        private_key_pem,
+        sealed_key,
+        modulus: generated.modulus,
+        exponent: generated.exponent,
+        created_us: now_seconds() * 1_000_000,
+        retire_after_us: 0,
+    })
 }
 
 struct GeneratedKey {

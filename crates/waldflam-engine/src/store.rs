@@ -73,6 +73,9 @@ pub struct StoredDocument {
     pub fields: HashMap<String, Value>,
 }
 
+/// MongoDB database used unless one is named explicitly.
+pub const DEFAULT_DATABASE: &str = "waldflam";
+
 /// Name of the shared collection every instance writes commit notices to and
 /// tails for other instances' commits.
 const EVENTS: &str = "_commit_events";
@@ -122,13 +125,20 @@ pub struct Store {
 
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self, EngineError> {
+        Self::connect_to(uri, DEFAULT_DATABASE).await
+    }
+
+    /// Connects using a named MongoDB database, so several independent
+    /// waldflam deployments — or several test runs — can share one cluster
+    /// without sharing credentials, signing keys or documents.
+    pub async fn connect_to(uri: &str, database: &str) -> Result<Self, EngineError> {
         let client = Client::with_uri_str(uri).await?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|since| since.as_nanos())
             .unwrap_or(0);
         let store = Self {
-            db: client.database("waldflam"),
+            db: client.database(database),
             instance_id: format!("{}-{nanos}", std::process::id()).into(),
             indexed_databases: Default::default(),
         };
